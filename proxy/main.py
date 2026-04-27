@@ -3,6 +3,7 @@ import sys
 import redis
 import logging
 import hashlib
+import datetime
 import time
 import litellm
 import json
@@ -10,6 +11,7 @@ from fastapi import FastAPI, Request, Header, HTTPException, BackgroundTasks, Bo
 from dotenv import load_dotenv
 
 from proxy.auth import verify_api_key
+from fastapi.middleware.cors import CORSMiddleware
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sdk"))
 from magnet import BehavioralMemory
 
@@ -19,6 +21,15 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Magnet Proxy", version="2.0")
+
+# CORS middleware to allow requests from your frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Replace with your frontend domain(s) in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 redis_url = os.getenv("REDIS_URL")
 r_sync = None
@@ -42,7 +53,7 @@ vmm_memory = BehavioralMemory(
 )
 
 
-async def safe_memory_add(vmm, messages_to_save: list, user_id: str, metadata: dict):
+async def safe_memory_add(vmm, messages_to_save: list, project_id: str, user_id: str, metadata: dict):
     """
     Asynchronously adds conversation data to the behavioral memory.
 
@@ -51,7 +62,7 @@ async def safe_memory_add(vmm, messages_to_save: list, user_id: str, metadata: d
     to prevent crashes and ensure system stability.
     """
     try:
-        await vmm.async_add(messages_to_save, user_id=user_id, metadata=metadata)
+        await vmm.async_add(messages_to_save, project_id=project_id, user_id=user_id, metadata=metadata)
     except Exception as e:
         logger.error(f"Background memory add failed for session {user_id}: {str(e)}")
 
@@ -65,23 +76,47 @@ def get_ab_group(session_id: str) -> str:
     val = int(hashlib.md5(session_id.encode()).hexdigest()[:8], 16)
     return "test" if val % 100 < 50 else "control"
 
-async def log_telemetry(redis_client, session_id: str, group: str, latency_ms: int, p_tokens: int, c_tokens: int, model: str, last_user_msg: str):
+async def log_telemetry(
+    redis_client, 
+    project_id: str, # Added project_id
+    session_id: str, 
+    group: str, 
+    latency_ms: int, 
+    p_tokens: int, 
+    c_tokens: int, 
+    model: str, 
+    last_user_msg: str
+):
     """
-    Logs performance and A/B testing metrics to Redis.
+    Logs performance and A/B testing metrics to Redis, scoped by project_id.
 
     This function runs as a background task to capture telemetry data without
     impacting response latency. It includes a simple heuristic for detecting
     correction signals in user messages.
+    Usage data is stored in project-specific Redis keys for easy aggregation.
     """
     if not redis_client:
         return
+    
+    # Project-specific keys for statistics and recent events
+    project_stats_key = f"project:{project_id}:stats"
+    project_events_key = f"project:{project_id}:events"
         
     try:
         import re
         correction_patterns = [r"\bno\b", r"\bnot\b", r"\bwrong\b", r"\bnot like that\b", r"\bfix\b"]
         is_correction = any(re.search(p, str(last_user_msg), re.IGNORECASE) for p in correction_patterns)
         
-        turn_number = redis_client.incr(f"vmm:telemetry:turns:{session_id}")
+        turn_number = redis_client.incr(f"project:{project_id}:turns:{session_id}")
+
+        # Update project-level aggregated stats
+        pipeline = redis_client.pipeline()
+        pipeline.hincrby(project_stats_key, 'total_requests', 1)
+        pipeline.hincrby(project_stats_key, 'total_tokens', p_tokens + c_tokens)
+        pipeline.hincrby(project_stats_key, 'total_latency_ms', latency_ms)
+        pipeline.hset(project_stats_key, 'last_activity', datetime.datetime.utcnow().isoformat())
+
+        # Log individual event to a project-specific list
         event = {
             "timestamp": time.time(),
             "session_id": session_id,
@@ -93,7 +128,9 @@ async def log_telemetry(redis_client, session_id: str, group: str, latency_ms: i
             "selected_model": model,
             "is_correction": is_correction
         }
-        redis_client.rpush("vmm:telemetry:events", json.dumps(event, ensure_ascii=False))
+        pipeline.lpush(project_events_key, json.dumps(event, ensure_ascii=False))
+        pipeline.ltrim(project_events_key, 0, 99) # Keep only the last 100 events
+        pipeline.execute()
     except Exception as e:
         logger.error(f"Telemetry logging failed: {e}")
 
@@ -108,6 +145,7 @@ async def chat_completions(
         "temperature": 0.7
     }]),
     x_session_id: str = Header("default_session"),
+    # auth_data now contains project_id
     auth_data: dict = Depends(verify_api_key)
 ):
     messages = body.get("messages", [])
@@ -116,7 +154,7 @@ async def chat_completions(
 
     # A/B Test: Inject behavioral profile only for users in the 'test' group.
     if ab_group == "test":
-        injection = vmm_memory.get_injection(user_id=x_session_id, current_messages=messages)
+        injection = vmm_memory.get_injection(project_id=auth_data["project_id"], user_id=x_session_id, current_messages=messages)
         if injection:
             system_msg = next((m for m in messages if m.get("role") == "system"), None)
             if system_msg:
@@ -126,6 +164,7 @@ async def chat_completions(
             body["messages"] = messages
 
     recommended = vmm_memory.get_recommended_model(
+        project_id=auth_data["project_id"],
         user_id=x_session_id,
         messages=messages,
     )
@@ -156,7 +195,8 @@ async def chat_completions(
             safe_memory_add,
             vmm_memory,
             messages_to_save,
-            x_session_id,
+            auth_data["project_id"], # Pass project_id
+            x_session_id, 
             metadata
         )
         
@@ -170,6 +210,7 @@ async def chat_completions(
         background_tasks.add_task(
             log_telemetry,
             r_sync,
+            auth_data["project_id"], # Pass project_id
             x_session_id,
             ab_group,
             latency_ms,
@@ -184,6 +225,28 @@ async def chat_completions(
         return dict(response)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM API Error: {str(e)}")
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Provides a basic health check endpoint for the proxy.
+    Checks Redis connection status.
+    """
+    try:
+        if r_sync:
+            r_sync.ping()
+            redis_status = "connected"
+        else:
+            redis_status = "disabled"
+        return {"status": "ok", "redis": redis_status, "uptime": time.time() - app.state.startup_time}
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
+
+@app.on_event("startup")
+async def startup_event():
+    app.state.startup_time = time.time()
 
 
 if __name__ == "__main__":

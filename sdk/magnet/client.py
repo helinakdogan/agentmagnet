@@ -99,6 +99,7 @@ class BehavioralMemory:
     def add(
         self,
         messages: list[dict],
+        project_id: str,
         user_id: str,
         session_id: str | None = None,
         metadata: dict | None = None,
@@ -113,16 +114,18 @@ class BehavioralMemory:
 
         Args:
             messages (list[dict]): The list of messages in the conversation.
+                project_id (str): The ID of the project.
             user_id (str): The ID of the user.
             session_id (str, optional): The ID of the current session.
             metadata (dict, optional): Additional metadata about the interaction.
         """
+        tenant_id = f"{project_id}:{user_id}"
         result = {}
         if self._mem0:
-            result = self._mem0.add(messages=messages, user_id=user_id, metadata=metadata or {}, **kwargs)
+            result = self._mem0.add(messages=messages, user_id=tenant_id, metadata=metadata or {}, **kwargs)
 
         try:
-            sid = session_id or user_id
+            sid = session_id or tenant_id
             signals = []
             classifier_complexity = "medium"
 
@@ -150,20 +153,20 @@ class BehavioralMemory:
                 signals = self._detector.detect(messages=messages, session_id=sid, metadata=metadata)
 
             if signals:
-                count = self._buffer.push(user_id, signals)
+                count = self._buffer.push(tenant_id, signals)
                 logger.debug(f"add(): {len(signals)} signals added, total={count}")
-                if self._buffer.should_reflect(user_id):
+                if self._buffer.should_reflect(tenant_id):
                     # Trigger reflection in the background if threshold is met.
                     try:
                         loop = asyncio.get_running_loop()
-                        loop.create_task(self._reflect_async(user_id))
+                        loop.create_task(self._reflect_async(tenant_id))
                     except RuntimeError:
-                        signals_to_reflect = self._buffer.flush(user_id) # Fallback for sync contexts
+                        signals_to_reflect = self._buffer.flush(tenant_id) # Fallback for sync contexts
                         if signals_to_reflect:
-                            asyncio.run(self._do_reflect(user_id, signals_to_reflect))
+                            asyncio.run(self._do_reflect(tenant_id, signals_to_reflect))
 
             if self.router:
-                profile = self.get_profile(user_id)
+                profile = self.get_profile(project_id, user_id)
                 routing_decision = self.router.route(messages, profile)
                 result["routing"] = {
                     "selected_model": routing_decision.selected_model,
@@ -179,24 +182,26 @@ class BehavioralMemory:
     async def async_add(
         self,
         messages: list[dict],
+        project_id: str,
         user_id: str,
         session_id: str | None = None,
         metadata: dict | None = None,
         **kwargs,
     ) -> dict:
         """Asynchronous version of the `add` method."""
+        tenant_id = f"{project_id}:{user_id}"
         result = {}
         if self._mem0:
             result = await asyncio.to_thread(
                 self._mem0.add,
                 messages=messages,
-                user_id=user_id,
+                user_id=tenant_id,
                 metadata=metadata or {},
                 **kwargs,
             )
 
         try:
-            sid = session_id or user_id
+            sid = session_id or tenant_id
             signals = []
             classifier_complexity = "medium"
 
@@ -224,13 +229,13 @@ class BehavioralMemory:
                 signals = self._detector.detect(messages=messages, session_id=sid, metadata=metadata)
 
             if signals:
-                count = self._buffer.push(user_id, signals)
+                count = self._buffer.push(tenant_id, signals)
                 logger.debug(f"async_add(): {len(signals)} signals added, total={count}")
-                if self._buffer.should_reflect(user_id):
-                    await self._reflect_async(user_id)
+                if self._buffer.should_reflect(tenant_id):
+                    await self._reflect_async(tenant_id)
 
             if self.router:
-                profile = self.get_profile(user_id)
+                profile = self.get_profile(project_id, user_id)
                 routing_decision = self.router.route(messages, profile)
                 result["routing"] = {
                     "selected_model": routing_decision.selected_model,
@@ -243,19 +248,20 @@ class BehavioralMemory:
 
         return result
 
-    def search(self, query: str, user_id: str, limit: int = 10, **kwargs) -> dict:
+    def search(self, query: str, project_id: str, user_id: str, limit: int = 10, **kwargs) -> dict:
         """
         Searches the memory and injects behavioral context into the results.
 
         Wraps the underlying provider's `search` method and, if enabled,
         appends the user's behavioral profile to the search results.
         """
+        tenant_id = f"{project_id}:{user_id}"
         result = {}
         if self._mem0:
-            result = self._mem0.search(query=query, user_id=user_id, limit=limit, **kwargs)
+            result = self._mem0.search(query=query, user_id=tenant_id, limit=limit, **kwargs)
 
         if self._inject_profile:
-            profile = self._store.load(user_id)
+            profile = self._store.load(tenant_id)
             if profile:
                 injection = self._reflector.build_injection(profile)
                 if injection:
@@ -263,42 +269,46 @@ class BehavioralMemory:
                     result["behavioral_profile"] = profile
         return result
 
-    def get_all(self, user_id: str, **kwargs) -> dict:
+    def get_all(self, project_id: str, user_id: str, **kwargs) -> dict:
         """Retrieves all memories for a user, including the behavioral profile."""
-        result = self._mem0.get_all(user_id=user_id, **kwargs) if self._mem0 else {"memories": []}
-        profile = self._store.load(user_id)
+        tenant_id = f"{project_id}:{user_id}"
+        result = self._mem0.get_all(user_id=tenant_id, **kwargs) if self._mem0 else {"memories": []}
+        profile = self._store.load(tenant_id)
         if profile:
             result["behavioral_profile"] = profile
         return result
 
-    def delete_all(self, user_id: str, **kwargs) -> dict:
+    def delete_all(self, project_id: str, user_id: str, **kwargs) -> dict:
         """Deletes all memories for a user, including the behavioral profile."""
-        result = self._mem0.delete_all(user_id=user_id, **kwargs) if self._mem0 else {}
-        self._store.delete(user_id)
-        self._detector.clear_session(user_id)
-        self._profile_cache.pop(user_id, None)
+        tenant_id = f"{project_id}:{user_id}"
+        result = self._mem0.delete_all(user_id=tenant_id, **kwargs) if self._mem0 else {}
+        self._store.delete(tenant_id)
+        self._detector.clear_session(tenant_id)
+        self._profile_cache.pop(tenant_id, None)
         return result
 
-    def get_profile(self, user_id: str) -> dict | None:
+    def get_profile(self, project_id: str, user_id: str) -> dict | None:
         """Retrieves a user's behavioral profile, using a time-based cache."""
+        tenant_id = f"{project_id}:{user_id}"
         now = time.time()
-        cached = self._profile_cache.get(user_id)
+        cached = self._profile_cache.get(tenant_id)
         if cached:
             profile, ts = cached
             if now - ts < self._profile_cache_ttl:
                 return profile
-        profile = self._store.load(user_id)
-        self._profile_cache[user_id] = (profile, now)
+        profile = self._store.load(tenant_id)
+        self._profile_cache[tenant_id] = (profile, now)
         return profile
 
-    def get_injection(self, user_id: str, current_messages: list[dict] | None = None) -> str:
+    def get_injection(self, project_id: str, user_id: str, current_messages: list[dict] | None = None) -> str:
         """
         Generates a system prompt injection string based on the user's profile.
 
         This method analyzes the context of the current messages to select the
         most relevant parts of the user's profile for injection.
         """
-        profile = self._store.load(user_id)
+        tenant_id = f"{project_id}:{user_id}"
+        profile = self._store.load(tenant_id)
         if not profile:
             return ""
             
@@ -310,47 +320,49 @@ class BehavioralMemory:
                 
         return self._reflector.build_injection(profile, current_context)
 
-    def force_reflect(self, user_id: str) -> dict:
+    def force_reflect(self, project_id: str, user_id: str) -> dict:
         """
         Triggers the reflection process immediately, bypassing the signal threshold.
 
         Useful for debugging and testing purposes.
         """
-        signals = self._buffer.flush(user_id)
+        tenant_id = f"{project_id}:{user_id}"
+        signals = self._buffer.flush(tenant_id)
         if not signals:
             return {}
-        existing_profile = self.get_profile(user_id)
-        profile = self._reflector.reflect(user_id, signals, existing_profile)
-        self._store.save(user_id, profile)
-        self._profile_cache.pop(user_id, None)
+        existing_profile = self.get_profile(project_id, user_id)
+        profile = self._reflector.reflect(tenant_id, signals, existing_profile)
+        self._store.save(tenant_id, profile)
+        self._profile_cache.pop(tenant_id, None)
         return profile
 
-    def get_pending_signals(self, user_id: str) -> list[dict]:
+    def get_pending_signals(self, project_id: str, user_id: str) -> list[dict]:
         """Returns the list of signals currently in the buffer for a user."""
-        return self._buffer.peek(user_id)
+        tenant_id = f"{project_id}:{user_id}"
+        return self._buffer.peek(tenant_id)
 
-    def get_recommended_model(self, user_id: str, messages: list[dict]) -> RouterDecision | None:
+    def get_recommended_model(self, project_id: str, user_id: str, messages: list[dict]) -> RouterDecision | None:
         """Recommends the optimal model for a given request using the router."""
         if not self.router:
             return None
-        profile = self.get_profile(user_id)
+        profile = self.get_profile(project_id, user_id)
         return self.router.route(messages, profile)
 
-    async def _reflect_async(self, user_id: str) -> None:
+    async def _reflect_async(self, tenant_id: str) -> None:
         """Schedules the reflection process to run as a background asyncio task."""
-        signals = self._buffer.flush(user_id)
+        signals = self._buffer.flush(tenant_id)
         if not signals:
             return
-        task = asyncio.create_task(self._do_reflect(user_id, signals))
+        task = asyncio.create_task(self._do_reflect(tenant_id, signals))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
-    async def _do_reflect(self, user_id: str, signals: list[dict]) -> None:
+    async def _do_reflect(self, tenant_id: str, signals: list[dict]) -> None:
         try:
-            existing_profile = await asyncio.to_thread(self.get_profile, user_id)
-            profile = await asyncio.to_thread(self._reflector.reflect, user_id, signals, existing_profile)
-            await asyncio.to_thread(self._store.save, user_id, profile)
-            self._profile_cache.pop(user_id, None)
-            logger.info(f"Reflect completed: {user_id}")
+            existing_profile = await asyncio.to_thread(self._store.load, tenant_id)
+            profile = await asyncio.to_thread(self._reflector.reflect, tenant_id, signals, existing_profile)
+            await asyncio.to_thread(self._store.save, tenant_id, profile)
+            self._profile_cache.pop(tenant_id, None)
+            logger.info(f"Reflect completed: {tenant_id}")
         except Exception as e:
-            logger.error(f"Reflect error ({user_id}): {e}")
+            logger.error(f"Reflect error ({tenant_id}): {e}")
