@@ -20,8 +20,19 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Magnet Proxy", version="2.0")
 
-redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-r_sync = redis.from_url(redis_url, decode_responses=True)
+redis_url = os.getenv("REDIS_URL")
+r_sync = None
+
+if redis_url:
+    try:
+        r_sync = redis.from_url(redis_url, decode_responses=True)
+        r_sync.ping()  # Verify connection works
+        logger.info("Successfully connected to Redis.")
+    except Exception as e:
+        logger.warning(f"Failed to connect to Redis at REDIS_URL. Falling back to in-memory mode. Error: {e}")
+        r_sync = None
+else:
+    logger.info("REDIS_URL is not set. Redis features disabled (falling back to in-memory mode).")
 
 vmm_memory = BehavioralMemory(
     api_key=os.getenv("MEM0_API_KEY"),
@@ -62,6 +73,9 @@ async def log_telemetry(redis_client, session_id: str, group: str, latency_ms: i
     impacting response latency. It includes a simple heuristic for detecting
     correction signals in user messages.
     """
+    if not redis_client:
+        return
+        
     try:
         import re
         correction_patterns = [r"\bno\b", r"\bnot\b", r"\bwrong\b", r"\bnot like that\b", r"\bfix\b"]
