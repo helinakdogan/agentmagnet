@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "magnet-sdk"
+version = "0.1.0"
+description = "Behavioral memory SDK for AI agents"
+requires-python = ">=3.9"
+dependencies = [
+    "redis>=5.0",
+    "python-dotenv>=1.0",
+    "litellm>=1.40.0",
+]
+
+[project.optional-dependencies]
+mem0 = ["mem0ai>=0.1"]
+dev = ["pytest>=8.0", "pytest-asyncio"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["magnet*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
