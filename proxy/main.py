@@ -9,8 +9,7 @@ import json
 from fastapi import FastAPI, Request, Header, HTTPException, BackgroundTasks, Body, Depends
 from dotenv import load_dotenv
 
-from auth import verify_api_key
-
+from proxy.auth import verify_api_key
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sdk"))
 from magnet import BehavioralMemory
 
