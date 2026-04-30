@@ -105,7 +105,11 @@ async def log_telemetry(
     try:
         import re
         correction_patterns = [r"\bno\b", r"\bnot\b", r"\bwrong\b", r"\bnot like that\b", r"\bfix\b"]
-        is_correction = any(re.search(p, str(last_user_msg), re.IGNORECASE) for p in correction_patterns)
+        rejection_patterns = [r"\bignore\b", r"\bforget\b", r"\bstart over\b", r"\bcancel\b", r"\bstop\b"]
+        
+        last_msg_str = str(last_user_msg).lower()
+        is_correction = any(re.search(p, last_msg_str) for p in correction_patterns)
+        is_rejection = any(re.search(p, last_msg_str) for p in rejection_patterns)
         
         turn_number = redis_client.incr(f"project:{project_id}:turns:{session_id}")
 
@@ -119,14 +123,14 @@ async def log_telemetry(
         # Log individual event to a project-specific list
         event = {
             "timestamp": time.time(),
-            "session_id": session_id,
+            "user_id": session_id,
             "group": group,
             "turn_number": turn_number,
             "latency_ms": latency_ms,
-            "prompt_tokens": p_tokens,
-            "completion_tokens": c_tokens,
-            "selected_model": model,
-            "is_correction": is_correction
+            "tokens": p_tokens + c_tokens,
+            "model": model,
+            "is_correction": is_correction,
+            "is_rejection": is_rejection
         }
         pipeline.lpush(project_events_key, json.dumps(event, ensure_ascii=False))
         pipeline.ltrim(project_events_key, 0, 99) # Keep only the last 100 events
