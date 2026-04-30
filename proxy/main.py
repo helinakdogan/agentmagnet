@@ -62,7 +62,7 @@ async def safe_memory_add(vmm, messages_to_save: list, project_id: str, user_id:
     to prevent crashes and ensure system stability.
     """
     try:
-        await vmm.async_add(messages_to_save, project_id=project_id, user_id=user_id, metadata=metadata)
+        await vmm.async_add(messages_to_save, user_id=user_id, project_id=project_id, metadata=metadata)
     except Exception as e:
         logger.error(f"Background memory add failed for session {user_id}: {str(e)}")
 
@@ -154,7 +154,7 @@ async def chat_completions(
 
     # A/B Test: Inject behavioral profile only for users in the 'test' group.
     if ab_group == "test":
-        injection = vmm_memory.get_injection(project_id=auth_data["project_id"], user_id=x_session_id, current_messages=messages)
+        injection = vmm_memory.get_injection(user_id=x_session_id, project_id=auth_data["project_id"], current_messages=messages)
         if injection:
             system_msg = next((m for m in messages if m.get("role") == "system"), None)
             if system_msg:
@@ -164,9 +164,9 @@ async def chat_completions(
             body["messages"] = messages
 
     recommended = vmm_memory.get_recommended_model(
-        project_id=auth_data["project_id"],
         user_id=x_session_id,
         messages=messages,
+        project_id=auth_data["project_id"],
     )
 
     if recommended:
@@ -178,11 +178,14 @@ async def chat_completions(
     start_time = time.time()
 
     try:
+        # Use the openai_api_key from auth if provided (BYOK), else fall back to env.
+        openai_api_key = auth_data.get("openai_api_key") or os.getenv("OPENAI_API_KEY")
         response = await litellm.acompletion(
             model=litellm_model,
             messages=messages,
             temperature=body.get("temperature", 0.7),
             max_tokens=body.get("max_tokens", None),
+            api_key=openai_api_key,
         )
         latency_ms = int((time.time() - start_time) * 1000)
         ai_message = response.choices[0].message.content
@@ -190,13 +193,12 @@ async def chat_completions(
         messages_to_save = messages + [{"role": "assistant", "content": ai_message}]
         metadata = {k: v for k, v in body.items() if k not in ["messages", "model"]}
 
-        # Schedule the memory persistence task to run in the background.
         background_tasks.add_task(
             safe_memory_add,
             vmm_memory,
             messages_to_save,
-            auth_data["project_id"], # Pass project_id
-            x_session_id, 
+            auth_data["project_id"],
+            x_session_id,
             metadata
         )
         

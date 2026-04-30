@@ -99,8 +99,8 @@ class BehavioralMemory:
     def add(
         self,
         messages: list[dict],
-        project_id: str,
         user_id: str,
+        project_id: str = "default",
         session_id: str | None = None,
         metadata: dict | None = None,
         **kwargs,
@@ -136,7 +136,6 @@ class BehavioralMemory:
                     context_msgs = messages[:-1] if len(messages) > 1 else []
                     cls_res = self.classifier.classify(context_msgs, last_msg)
                     if cls_res.signal_type in ("correction", "rejection", "preference", "formatting_preference", "tone_preference", "detail_preference"):
-                     if cls_res.signal_type in ("correction", "rejection", "preference", "formatting_preference", "tone_preference", "detail_preference"):
                         signals.append(
                             {
                                 "type": cls_res.signal_type,
@@ -159,14 +158,22 @@ class BehavioralMemory:
                     # Trigger reflection in the background if threshold is met.
                     try:
                         loop = asyncio.get_running_loop()
+                        # We're inside an async context — schedule as a background task.
                         loop.create_task(self._reflect_async(tenant_id))
                     except RuntimeError:
-                        signals_to_reflect = self._buffer.flush(tenant_id) # Fallback for sync contexts
+                        # No running event loop — we're in a pure sync context.
+                        # Run reflection in a background thread to avoid blocking.
+                        signals_to_reflect = self._buffer.flush(tenant_id)
                         if signals_to_reflect:
-                            asyncio.run(self._do_reflect(tenant_id, signals_to_reflect))
+                            import threading
+                            t = threading.Thread(
+                                target=lambda: asyncio.run(self._do_reflect(tenant_id, signals_to_reflect)),
+                                daemon=True,
+                            )
+                            t.start()
 
             if self.router:
-                profile = self.get_profile(project_id, user_id)
+                profile = self.get_profile(user_id, project_id)
                 routing_decision = self.router.route(messages, profile)
                 result["routing"] = {
                     "selected_model": routing_decision.selected_model,
@@ -182,8 +189,8 @@ class BehavioralMemory:
     async def async_add(
         self,
         messages: list[dict],
-        project_id: str,
         user_id: str,
+        project_id: str = "default",
         session_id: str | None = None,
         metadata: dict | None = None,
         **kwargs,
@@ -235,7 +242,7 @@ class BehavioralMemory:
                     await self._reflect_async(tenant_id)
 
             if self.router:
-                profile = self.get_profile(project_id, user_id)
+                profile = self.get_profile(user_id, project_id)
                 routing_decision = self.router.route(messages, profile)
                 result["routing"] = {
                     "selected_model": routing_decision.selected_model,
@@ -248,7 +255,7 @@ class BehavioralMemory:
 
         return result
 
-    def search(self, query: str, project_id: str, user_id: str, limit: int = 10, **kwargs) -> dict:
+    def search(self, query: str, user_id: str, project_id: str = "default", limit: int = 10, **kwargs) -> dict:
         """
         Searches the memory and injects behavioral context into the results.
 
@@ -269,7 +276,7 @@ class BehavioralMemory:
                     result["behavioral_profile"] = profile
         return result
 
-    def get_all(self, project_id: str, user_id: str, **kwargs) -> dict:
+    def get_all(self, user_id: str, project_id: str = "default", **kwargs) -> dict:
         """Retrieves all memories for a user, including the behavioral profile."""
         tenant_id = f"{project_id}:{user_id}"
         result = self._mem0.get_all(user_id=tenant_id, **kwargs) if self._mem0 else {"memories": []}
@@ -278,7 +285,7 @@ class BehavioralMemory:
             result["behavioral_profile"] = profile
         return result
 
-    def delete_all(self, project_id: str, user_id: str, **kwargs) -> dict:
+    def delete_all(self, user_id: str, project_id: str = "default", **kwargs) -> dict:
         """Deletes all memories for a user, including the behavioral profile."""
         tenant_id = f"{project_id}:{user_id}"
         result = self._mem0.delete_all(user_id=tenant_id, **kwargs) if self._mem0 else {}
@@ -287,7 +294,7 @@ class BehavioralMemory:
         self._profile_cache.pop(tenant_id, None)
         return result
 
-    def get_profile(self, project_id: str, user_id: str) -> dict | None:
+    def get_profile(self, user_id: str, project_id: str = "default") -> dict | None:
         """Retrieves a user's behavioral profile, using a time-based cache."""
         tenant_id = f"{project_id}:{user_id}"
         now = time.time()
@@ -300,7 +307,7 @@ class BehavioralMemory:
         self._profile_cache[tenant_id] = (profile, now)
         return profile
 
-    def get_injection(self, project_id: str, user_id: str, current_messages: list[dict] | None = None) -> str:
+    def get_injection(self, user_id: str, project_id: str = "default", current_messages: list[dict] | None = None) -> str:
         """
         Generates a system prompt injection string based on the user's profile.
 
@@ -320,7 +327,7 @@ class BehavioralMemory:
                 
         return self._reflector.build_injection(profile, current_context)
 
-    def force_reflect(self, project_id: str, user_id: str) -> dict:
+    def force_reflect(self, user_id: str, project_id: str = "default") -> dict:
         """
         Triggers the reflection process immediately, bypassing the signal threshold.
 
@@ -336,12 +343,12 @@ class BehavioralMemory:
         self._profile_cache.pop(tenant_id, None)
         return profile
 
-    def get_pending_signals(self, project_id: str, user_id: str) -> list[dict]:
+    def get_pending_signals(self, user_id: str, project_id: str = "default") -> list[dict]:
         """Returns the list of signals currently in the buffer for a user."""
         tenant_id = f"{project_id}:{user_id}"
         return self._buffer.peek(tenant_id)
 
-    def get_recommended_model(self, project_id: str, user_id: str, messages: list[dict]) -> RouterDecision | None:
+    def get_recommended_model(self, user_id: str, messages: list[dict], project_id: str = "default") -> RouterDecision | None:
         """Recommends the optimal model for a given request using the router."""
         if not self.router:
             return None

@@ -41,7 +41,7 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(se
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
 
     try:
-        response = supabase.table("api_keys").select("id, project_id").eq("key_hash", key_hash).eq("is_active", True).execute()
+        response = supabase.table("api_keys").select("id, project_id, project_uuid").eq("key_hash", key_hash).eq("is_active", True).execute()
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database error: {str(e)}")
 
@@ -51,7 +51,12 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(se
             detail="Invalid or inactive API key."
         )
 
+    row = response.data[0]
+    # Use project_uuid (UUID type) as the canonical identifier; fall back to text project_id.
+    canonical_project_id = row.get("project_uuid") or row.get("project_id")
+
     return {
-        "api_key_id": response.data[0]["id"],
-        "project_id": response.data[0]["project_id"]
+        "api_key_id": row["id"],
+        "project_id": canonical_project_id,
+        "openai_api_key": None,  # Reserved for future BYOK: add openai_api_key column to api_keys table
     }
