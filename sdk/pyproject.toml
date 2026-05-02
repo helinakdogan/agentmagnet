@@ -14,7 +14,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mem0 = ["mem0ai>=0.1"]
 dev = ["pytest>=8.0", "pytest-asyncio"]
 
 [tool.setuptools.packages.find]

@@ -1,11 +1,11 @@
 """
 BehavioralMemory
 ----------------
-Mem0 wrapper + behavioral memory layer.
+Behavioral memory layer with BYOK (Bring Your Own Key) support.
 
-This is the main client-facing class. It provides a drop-in replacement for
-mem0.MemoryClient, augmenting it with behavioral learning capabilities such
-as signal detection, reflection, and intelligent routing.
+This is the main client-facing class. It provides intelligent behavioral
+learning capabilities including signal detection, reflection, and model routing.
+No third-party memory provider dependency required.
 """
 
 from __future__ import annotations
@@ -30,28 +30,38 @@ class BehavioralMemory:
     """
     A memory client that learns from user behavior.
 
-    This class wraps a standard memory client (like Mem0) and adds a
-    behavioral layer that observes user interactions, extracts signals,
-    and builds a dynamic user profile to personalize future responses.
+    This class provides a behavioral layer that observes user interactions,
+    extracts signals, and builds a dynamic user profile to personalize
+    future responses. All processing happens within your own infrastructure.
 
     Args:
-        api_key (str, optional): API key for the underlying memory provider (e.g., Mem0).
+        openai_api_key (str, optional): BYOK — OpenAI API key for the Reflector LLM.
+            Falls back to OPENAI_API_KEY environment variable if not provided.
+        anthropic_api_key (str, optional): BYOK — Anthropic API key (alternative).
+            Falls back to ANTHROPIC_API_KEY environment variable if not provided.
         redis_client (Any, optional): An initialized Redis client for persistence.
         signal_threshold (int): Number of signals to buffer before triggering reflection.
         reflector_model (str): The LLM to use for the reflection process.
         classifier_model (str): The LLM to use for the classification fallback.
         router (ModelRouter, optional): An instance of ModelRouter for dynamic model selection.
+        qdrant_url (str, optional): Qdrant vector DB URL for long-term storage (optional).
+        qdrant_api_key (str, optional): Qdrant API key.
     """
     def __init__(
         self,
-        api_key: str | None = None,
+        openai_api_key: str | None = None,
+        anthropic_api_key: str | None = None,
         redis_client: Any | None = None,
         signal_threshold: int = 5,
         reflector_model: str = "openai/gpt-4o-mini",
         classifier_model: str = "openai/gpt-4o-mini",
         inject_profile: bool = True,
-        use_mem0: bool = True,
         router: ModelRouter | None = None,
+        qdrant_url: str | None = None,
+        qdrant_api_key: str | None = None,
+        # Legacy parameters — silently ignored for backwards compatibility
+        api_key: str | None = None,
+        use_mem0: bool = False,
         openai_client: Any = None,
         anthropic_client: Any = None,
         **kwargs,
@@ -62,6 +72,10 @@ class BehavioralMemory:
         self._profile_cache_ttl = 60.0
         self._background_tasks: set[asyncio.Task] = set()
 
+        # BYOK — read from parameter or fall back to environment variable
+        self._byok_openai_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
+        self._byok_anthropic_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
+
         if openai_client is not None:
             logger.warning("BehavioralMemory: openai_client deprecated, ignoring.")
         if anthropic_client is not None:
@@ -69,25 +83,12 @@ class BehavioralMemory:
         if kwargs:
             logger.warning(f"BehavioralMemory: unknown parameters ignored: {list(kwargs.keys())}")
 
-        self._mem0 = None
-        if use_mem0:
-            try:
-                from mem0 import MemoryClient
-
-                key = api_key or os.environ.get("MEM0_API_KEY", "")
-                if key:
-                    self._mem0 = MemoryClient(api_key=key)
-                else:
-                    logger.warning("MEM0_API_KEY not found. Mem0 is disabled.")
-            except ImportError:
-                logger.warning("mem0ai package not installed: pip install mem0ai")
-
         self._detector = SignalDetector(param_change_threshold=3, redis_client=redis_client)
         self._buffer = SignalBuffer(redis_client=redis_client, threshold=signal_threshold)
         self._reflector = Reflector(
             model=reflector_model,
-            openai_client=openai_client,
-            anthropic_client=anthropic_client,
+            openai_api_key=self._byok_openai_key,
+            anthropic_api_key=self._byok_anthropic_key,
         )
         self.classifier = IntelligentClassifier(
             model=classifier_model,
@@ -106,28 +107,24 @@ class BehavioralMemory:
         **kwargs,
     ) -> dict:
         """
-        Adds a conversation to memory and processes it for behavioral signals.
-
-        This method first calls the underlying memory provider's `add` method,
-        then asynchronously processes the messages to detect signals, update
-        the signal buffer, and trigger reflection if the threshold is met.
+        Adds a conversation to behavioral memory and processes it for signals.
 
         Args:
             messages (list[dict]): The list of messages in the conversation.
-                project_id (str): The ID of the project.
+            project_id (str): The ID of the project.
             user_id (str): The ID of the user.
             session_id (str, optional): The ID of the current session.
             metadata (dict, optional): Additional metadata about the interaction.
+
+        Returns:
+            dict: Result containing routing information if a router is configured.
         """
         tenant_id = f"{project_id}:{user_id}"
         result = {}
-        if self._mem0:
-            result = self._mem0.add(messages=messages, user_id=tenant_id, metadata=metadata or {}, **kwargs)
 
         try:
             sid = session_id or tenant_id
             signals = []
-            classifier_complexity = "medium"
 
             if self.classifier:
                 user_msgs = [m for m in messages if m.get("role") == "user"]
@@ -155,14 +152,10 @@ class BehavioralMemory:
                 count = self._buffer.push(tenant_id, signals)
                 logger.debug(f"add(): {len(signals)} signals added, total={count}")
                 if self._buffer.should_reflect(tenant_id):
-                    # Trigger reflection in the background if threshold is met.
                     try:
                         loop = asyncio.get_running_loop()
-                        # We're inside an async context — schedule as a background task.
                         loop.create_task(self._reflect_async(tenant_id))
                     except RuntimeError:
-                        # No running event loop — we're in a pure sync context.
-                        # Run reflection in a background thread to avoid blocking.
                         signals_to_reflect = self._buffer.flush(tenant_id)
                         if signals_to_reflect:
                             import threading
@@ -198,19 +191,10 @@ class BehavioralMemory:
         """Asynchronous version of the `add` method."""
         tenant_id = f"{project_id}:{user_id}"
         result = {}
-        if self._mem0:
-            result = await asyncio.to_thread(
-                self._mem0.add,
-                messages=messages,
-                user_id=tenant_id,
-                metadata=metadata or {},
-                **kwargs,
-            )
 
         try:
             sid = session_id or tenant_id
             signals = []
-            classifier_complexity = "medium"
 
             if self.classifier:
                 user_msgs = [m for m in messages if m.get("role") == "user"]
@@ -218,7 +202,6 @@ class BehavioralMemory:
                     last_msg = user_msgs[-1].get("content", "")
                     context_msgs = messages[:-1] if len(messages) > 1 else []
                     cls_res = await asyncio.to_thread(self.classifier.classify, context_msgs, last_msg)
-                    classifier_complexity = cls_res.query_complexity
                     if cls_res.signal_type in ("correction", "rejection", "positive", "clarification"):
                         signals.append(
                             {
@@ -228,7 +211,7 @@ class BehavioralMemory:
                                 "dimension": cls_res.dimension,
                             }
                         )
-                if metadata: # Also check for parameter changes (zero-cost)
+                if metadata:
                     param_sig = self._detector._check_param_change(sid, metadata)
                     if param_sig:
                         signals.append(param_sig)
@@ -257,42 +240,37 @@ class BehavioralMemory:
 
     def search(self, query: str, user_id: str, project_id: str = "default", limit: int = 10, **kwargs) -> dict:
         """
-        Searches the memory and injects behavioral context into the results.
+        Returns behavioral context for a user based on their learned profile.
 
-        Wraps the underlying provider's `search` method and, if enabled,
-        appends the user's behavioral profile to the search results.
+        Args:
+            query (str): The search query (used for context-aware injection).
+            user_id (str): The ID of the user.
+            project_id (str): The ID of the project.
+            limit (int): Unused — kept for API compatibility.
+
+        Returns:
+            dict: Contains 'behavioral_context' (injection string) and 'behavioral_profile'.
         """
         tenant_id = f"{project_id}:{user_id}"
-        result = {}
-        if self._mem0:
-            result = self._mem0.search(query=query, user_id=tenant_id, limit=limit, **kwargs)
-
-        if self._inject_profile:
-            profile = self._store.load(tenant_id)
-            if profile:
-                injection = self._reflector.build_injection(profile)
-                if injection:
-                    result["behavioral_context"] = injection
-                    result["behavioral_profile"] = profile
-        return result
+        profile = self._store.load(tenant_id)
+        if not profile:
+            return {}
+        injection = self._reflector.build_injection(profile) if self._inject_profile else ""
+        return {"behavioral_context": injection, "behavioral_profile": profile}
 
     def get_all(self, user_id: str, project_id: str = "default", **kwargs) -> dict:
-        """Retrieves all memories for a user, including the behavioral profile."""
+        """Retrieves the full behavioral profile for a user."""
         tenant_id = f"{project_id}:{user_id}"
-        result = self._mem0.get_all(user_id=tenant_id, **kwargs) if self._mem0 else {"memories": []}
         profile = self._store.load(tenant_id)
-        if profile:
-            result["behavioral_profile"] = profile
-        return result
+        return {"behavioral_profile": profile} if profile else {}
 
     def delete_all(self, user_id: str, project_id: str = "default", **kwargs) -> dict:
-        """Deletes all memories for a user, including the behavioral profile."""
+        """Deletes all behavioral memory for a user."""
         tenant_id = f"{project_id}:{user_id}"
-        result = self._mem0.delete_all(user_id=tenant_id, **kwargs) if self._mem0 else {}
         self._store.delete(tenant_id)
         self._detector.clear_session(tenant_id)
         self._profile_cache.pop(tenant_id, None)
-        return result
+        return {"deleted": True}
 
     def get_profile(self, user_id: str, project_id: str = "default") -> dict | None:
         """Retrieves a user's behavioral profile, using a time-based cache."""
@@ -318,19 +296,18 @@ class BehavioralMemory:
         profile = self._store.load(tenant_id)
         if not profile:
             return ""
-            
+
         current_context = "general_chat"
         if current_messages:
             user_msgs = [m["content"] for m in current_messages if m.get("role") == "user"]
             if user_msgs:
                 current_context = ContextClassifier.detect(user_msgs[-1])
-                
+
         return self._reflector.build_injection(profile, current_context)
 
     def force_reflect(self, user_id: str, project_id: str = "default") -> dict:
         """
         Triggers the reflection process immediately, bypassing the signal threshold.
-
         Useful for debugging and testing purposes.
         """
         tenant_id = f"{project_id}:{user_id}"

@@ -64,10 +64,14 @@ class Reflector:
     def __init__(
         self,
         model: str = "openai/gpt-4o-mini",
+        openai_api_key: str | None = None,
+        anthropic_api_key: str | None = None,
         profile_ttl: int = 60 * 60 * 24 * 30,
         **kwargs,
     ):
         self.model = model
+        self._openai_api_key = openai_api_key
+        self._anthropic_api_key = anthropic_api_key
         self.profile_ttl = profile_ttl
 
         if "openai_client" in kwargs and kwargs["openai_client"] is not None:
@@ -119,11 +123,7 @@ class Reflector:
 
     def build_injection(self, profile: dict, current_context: str = "general_chat") -> str:
         """
-        Constructs a system prompt injection string from the user profile.
-
-        This method generates a concise, human-readable summary of the user's
-        preferences relevant to the current interaction context. This string
-        is designed to be injected into an LLM's system prompt.
+        Constructs a rich system prompt injection string from the user profile.
 
         Args:
             profile (dict): The user's behavioral profile.
@@ -139,26 +139,44 @@ class Reflector:
         if not global_prefs and not ctx_profile:
             return ""
 
-        lines = [f"[Behavioral Profile | Context: {current_context.upper()}]"]
-        
-        for k, v in global_prefs.items():
-            if isinstance(v, dict) and "value" in v:
-                if v["value"] not in (None, "unknown", ""):
-                    lines.append(f"  - General {k}: {v['value']}")
-            elif k == "patterns" and isinstance(v, list):
-                for p in v: lines.append(f"  - Rule: {p}")
+        lines = ["[Behavioral Profile]"]
 
-        if ctx_profile:
-            lines.append("Preferences for this Context:")
-            for k, v in ctx_profile.items():
-                if isinstance(v, dict) and "value" in v and v["value"] not in (None, "unknown", ""):
-                    lines.append(f"  - {k}: {v['value']}")
+        # Global learned preferences with confidence percentages
+        all_prefs = {}
+        for k, v in global_prefs.items():
+            if k == "patterns":
+                continue
+            if isinstance(v, dict) and "value" in v and v["value"] not in (None, "unknown", ""):
+                all_prefs[k] = v
+
+        # Context-specific preferences override/supplement global ones
+        for k, v in ctx_profile.items():
+            if isinstance(v, dict) and "value" in v and v["value"] not in (None, "unknown", ""):
+                all_prefs[k] = v
+
+        if all_prefs:
+            lines.append("\nLearned preferences:")
+            for k, v in all_prefs.items():
+                confidence = v.get("confidence", 0)
+                pct = int(confidence * 100)
+                lines.append(f"  - {k}: {v['value']} (confidence: {pct}%)")
+
+        # Recent behavioral patterns
+        patterns = global_prefs.get("patterns", [])
+        if isinstance(patterns, list) and patterns:
+            lines.append("\nRecent patterns:")
+            for p in patterns[:3]:
+                lines.append(f"  - {p}")
+
+        lines.append("\nNote: These preferences were learned from user behavior, not explicit instructions.")
+        lines.append("Respect them but allow the user to override at any time.")
 
         return "\n".join(lines)
 
     def _call_llm(self, prompt: str) -> str:
         """
         Invokes the LLM with the system and user prompts for reflection.
+        Uses the BYOK key if provided, otherwise falls back to litellm defaults.
 
         Args:
             prompt (str): The formatted user prompt containing signals.
@@ -166,6 +184,11 @@ class Reflector:
         Returns:
             str: The raw string content from the LLM's response.
         """
+        api_key = (
+            self._openai_api_key if "openai" in self.model
+            else self._anthropic_api_key
+        ) or None  # None lets litellm use its own env fallback
+
         response = litellm.completion(
             model=self.model,
             messages=[
@@ -173,7 +196,8 @@ class Reflector:
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
-            max_tokens=400,
+            max_tokens=500,
+            api_key=api_key,
         )
         return response.choices[0].message.content
 

@@ -46,10 +46,9 @@ else:
     logger.info("REDIS_URL is not set. Redis features disabled (falling back to in-memory mode).")
 
 vmm_memory = BehavioralMemory(
-    api_key=os.getenv("MEM0_API_KEY"),
+    openai_api_key=os.getenv("OPENAI_API_KEY"),
     redis_client=r_sync,
     signal_threshold=3,
-    use_mem0=True,
 )
 
 
@@ -130,7 +129,8 @@ async def log_telemetry(
             "tokens": p_tokens + c_tokens,
             "model": model,
             "is_correction": is_correction,
-            "is_rejection": is_rejection
+            "is_rejection": is_rejection,
+            "message": last_msg_str[:250]
         }
         pipeline.lpush(project_events_key, json.dumps(event, ensure_ascii=False))
         pipeline.ltrim(project_events_key, 0, 99) # Keep only the last 100 events
