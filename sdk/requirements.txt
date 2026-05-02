@@ -1,9 +1,7 @@
 litellm>=1.40.0
 redis>=5.0
 python-dotenv>=1.0
-mem0ai>=0.1
 fastapi
 uvicorn
-streamlit
 requests
 supabase

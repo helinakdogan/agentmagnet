@@ -36,6 +36,7 @@ OUTPUT FORMAT (only JSON, write nothing else):
 
 RULES:
 - Provide a value (string) and confidence (float between 0.0 - 1.0) for each preference.
+- Her preference için 0.0-1.0 arası confidence score ver. 1 sinyal = 0.3, 3 sinyal = 0.6, 5+ sinyal = 0.85+
 - Only extract preferences explicitly stated in the signal. Do not add contexts and preferences not present in the signal.
 - Never guess or hallucinate.
 """
@@ -51,15 +52,6 @@ Extract the behavioral profile from these signals."""
 class Reflector:
     """
     Analyzes behavioral signals to generate and update a user's profile.
-
-    The Reflector is the core component for learning from user behavior. It takes
-    a collection of signals, uses an LLM to interpret them as preference
-    updates, and then merges these updates into the existing user profile state.
-    This process includes logic for time decay and conflict resolution to ensure
-    the profile remains relevant and accurate over time.
-
-    Attributes:
-        model (str): The identifier for the LLM used for reflection.
     """
     def __init__(
         self,
@@ -82,23 +74,19 @@ class Reflector:
     def reflect(self, user_id: str, signals: list[dict], existing_profile: dict | None = None) -> dict:
         """
         Performs the reflection process to update a user profile.
-
-        Takes a list of new signals and an existing profile, invokes an LLM to
-        generate a profile "patch" from the signals, and then merges this patch
-        into the profile state.
-
-        Args:
-            user_id (str): The ID of the user.
-            signals (list[dict]): A list of new behavioral signals to process.
-            existing_profile (dict | None): The current user profile state.
-
-        Returns:
-            dict: The updated user profile.
         """
         if not signals:
             return existing_profile or self._empty_profile()
 
         current_state = self._migrate_profile(existing_profile) if existing_profile else self._empty_profile()
+
+        now = time.time()
+        last_reflected = current_state.get("reflected_at")
+        if last_reflected:
+            days_elapsed = (now - last_reflected) / 86400
+            decay_factor = max(0.5, 1.0 - (days_elapsed * 0.02))  # günde %2 düşüş
+            for key in current_state.get("confidence_scores", {}):
+                current_state["confidence_scores"][key] *= decay_factor
 
         prompt = _USER_TEMPLATE.format(
             user_id=user_id,
@@ -110,8 +98,10 @@ class Reflector:
             raw = self._call_llm(prompt)
             updates = self._parse(raw)
             
-            # Apply deterministic state updates based on the LLM's output.
-            profile = self._merge_state(current_state, updates)
+            # Count corrections from the new signals to penalize confidence if needed
+            is_correction = any(s.get("type") in ("correction", "rejection") for s in signals)
+            
+            profile = self._merge_state(current_state, updates, is_correction)
             
             profile["reflected_at"] = time.time()
             profile["signal_count"] = len(signals)
@@ -124,24 +114,17 @@ class Reflector:
     def build_injection(self, profile: dict, current_context: str = "general_chat") -> str:
         """
         Constructs a rich system prompt injection string from the user profile.
-
-        Args:
-            profile (dict): The user's behavioral profile.
-            current_context (str): The detected context of the current query.
-
-        Returns:
-            str: The formatted string for prompt injection, or an empty string.
         """
         profile = self._migrate_profile(profile)
         global_prefs = profile.get("global_preferences", {})
         ctx_profile = profile.get("contextual_profiles", {}).get(current_context, {})
+        confidence_scores = profile.get("confidence_scores", {})
 
         if not global_prefs and not ctx_profile:
             return ""
 
         lines = ["[Behavioral Profile]"]
 
-        # Global learned preferences with confidence percentages
         all_prefs = {}
         for k, v in global_prefs.items():
             if k == "patterns":
@@ -149,7 +132,6 @@ class Reflector:
             if isinstance(v, dict) and "value" in v and v["value"] not in (None, "unknown", ""):
                 all_prefs[k] = v
 
-        # Context-specific preferences override/supplement global ones
         for k, v in ctx_profile.items():
             if isinstance(v, dict) and "value" in v and v["value"] not in (None, "unknown", ""):
                 all_prefs[k] = v
@@ -157,11 +139,10 @@ class Reflector:
         if all_prefs:
             lines.append("\nLearned preferences:")
             for k, v in all_prefs.items():
-                confidence = v.get("confidence", 0)
-                pct = int(confidence * 100)
+                conf = confidence_scores.get(k, v.get("confidence", 0))
+                pct = int(conf * 100)
                 lines.append(f"  - {k}: {v['value']} (confidence: {pct}%)")
 
-        # Recent behavioral patterns
         patterns = global_prefs.get("patterns", [])
         if isinstance(patterns, list) and patterns:
             lines.append("\nRecent patterns:")
@@ -174,20 +155,10 @@ class Reflector:
         return "\n".join(lines)
 
     def _call_llm(self, prompt: str) -> str:
-        """
-        Invokes the LLM with the system and user prompts for reflection.
-        Uses the BYOK key if provided, otherwise falls back to litellm defaults.
-
-        Args:
-            prompt (str): The formatted user prompt containing signals.
-
-        Returns:
-            str: The raw string content from the LLM's response.
-        """
         api_key = (
             self._openai_api_key if "openai" in self.model
             else self._anthropic_api_key
-        ) or None  # None lets litellm use its own env fallback
+        ) or None 
 
         response = litellm.completion(
             model=self.model,
@@ -202,14 +173,6 @@ class Reflector:
         return response.choices[0].message.content
 
     def _parse(self, raw: str) -> dict:
-        """
-        Parses the raw LLM output string into a JSON dictionary.
-
-        Handles common LLM output variations like markdown code blocks.
-
-        Args:
-            raw (str): The raw string response from the LLM.
-        """
         raw = raw.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -217,21 +180,16 @@ class Reflector:
                 raw = raw[4:]
         return json.loads(raw.strip())
 
-    def _merge_state(self, current: dict, updates: dict) -> dict:
+    def _merge_state(self, current: dict, updates: dict, is_correction: bool = False) -> dict:
         """
-        Merges a profile update patch into the current profile state.
-
-        This is the core deterministic logic for state management. It handles:
-        - Adding new preferences.
-        - Reinforcing existing preferences.
-        - Resolving conflicts between old and new preferences.
-        - Applying a time-decay factor to the confidence of old preferences.
-
-        Args:
-            current (dict): The existing user profile.
-            updates (dict): The profile patch generated by the LLM.
+        Eğer existing_profile varsa:
+        Yeni sinyaller existing_profile'ı tamamen ezmez.
+        Bunun yerine merge et:
+        - Aynı preference key varsa: confidence = max(mevcut, yeni)
+        - Yeni key ise: ekle
+        - Düzeltme sinyali ise: ilgili key'in confidence'ını düşür (-0.2)
         """
-        now = time.time()
+        confidence_scores = current.setdefault("confidence_scores", {})
         
         for scope in ["global_preferences", "contextual_profiles"]:
             curr_scope = current.setdefault(scope, {})
@@ -254,60 +212,46 @@ class Reflector:
                     
                     old_data = target_dict.get(pref_key)
                     
-                    if not old_data or not isinstance(old_data, dict) or "value" not in old_data:
-                        # A new preference is being added.
-                        target_dict[pref_key] = {
-                            "value": new_val, "confidence": new_conf, "evidence_count": 1,
-                            "last_updated": now, "decay_weight": 1.0, "source_context": ctx_key
-                        }
+                    if not old_data:
+                        target_dict[pref_key] = {"value": new_val}
+                        confidence_scores[pref_key] = new_conf
                     else:
-                        # An existing preference is being updated or challenged.
-                        days_elapsed = (now - old_data.get("last_updated", now)) / (60*60*24)
-                        decayed_conf = old_data.get("confidence", 0.5) * (0.95 ** max(0, days_elapsed))
+                        mevcut_conf = confidence_scores.get(pref_key, 0.5)
                         
-                        if new_val == old_data["value"]:
-                            # Reinforce the existing preference.
-                            old_data["confidence"] = min(1.0, decayed_conf + (new_conf * 0.2))
-                            old_data["evidence_count"] += 1
-                            old_data["last_updated"] = now
+                        if is_correction:
+                            confidence_scores[pref_key] = max(0.0, mevcut_conf - 0.2)
+                            # Overwrite value based on new correction
+                            target_dict[pref_key] = {"value": new_val}
                         else:
-                            # A conflict exists. Decide whether to overwrite or resist.
-                            if new_conf > decayed_conf:
-                                # Overwrite with the new preference.
-                                old_data["value"] = new_val
-                                old_data["confidence"] = new_conf
-                                old_data["evidence_count"] = 1
-                                old_data["last_updated"] = now
+                            if new_val == old_data.get("value"):
+                                confidence_scores[pref_key] = max(mevcut_conf, new_conf)
                             else:
-                                # Resist the change but reduce confidence in the old preference.
-                                old_data["confidence"] = max(0.1, decayed_conf - (new_conf * 0.2))
-                                old_data["last_updated"] = now
-
+                                if new_conf > mevcut_conf:
+                                    target_dict[pref_key] = {"value": new_val}
+                                    confidence_scores[pref_key] = new_conf
+                                else:
+                                    confidence_scores[pref_key] = max(0.1, mevcut_conf - 0.2)
+                                    
         return current
 
     @staticmethod
     def _empty_profile() -> dict:
-        """Returns a new, empty profile structure."""
         return {
             "global_preferences": {},
             "contextual_profiles": {
                 "coding": {}, "business_strategy": {}, "writing": {}, "learning": {}, "general_chat": {}
             },
+            "confidence_scores": {},
             "reflected_at": None,
             "signal_count": 0,
         }
 
     def _migrate_profile(self, profile: dict) -> dict:
-        """
-        Ensures backward compatibility by migrating old profile formats.
-
-        If an old, non-context-aware profile is loaded, this method converts
-        it to the new structured format.
-        """
         if "contextual_profiles" in profile:
+            if "confidence_scores" not in profile:
+                profile["confidence_scores"] = {}
             return profile
             
-        # Found a legacy profile format, migrating...
         prefs = profile.get("preferences", {})
         return {
             "global_preferences": {
@@ -321,6 +265,7 @@ class Reflector:
                 },
                 "coding": {}, "business_strategy": {}, "writing": {}, "learning": {}
             },
+            "confidence_scores": {},
             "reflected_at": profile.get("reflected_at", time.time()),
             "signal_count": profile.get("signal_count", 0)
         }
