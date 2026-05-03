@@ -202,7 +202,7 @@ class BehavioralMemory:
                     last_msg = user_msgs[-1].get("content", "")
                     context_msgs = messages[:-1] if len(messages) > 1 else []
                     cls_res = await asyncio.to_thread(self.classifier.classify, context_msgs, last_msg)
-                    if cls_res.signal_type in ("correction", "rejection", "positive", "clarification"):
+                    if cls_res.signal_type in ("correction", "rejection", "preference", "formatting_preference", "tone_preference", "detail_preference"):
                         signals.append(
                             {
                                 "type": cls_res.signal_type,

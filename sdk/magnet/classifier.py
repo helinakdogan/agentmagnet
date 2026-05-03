@@ -35,6 +35,7 @@ TASK:
 1. Signal Type: Choose from "correction", "rejection", "preference", "formatting_preference", "tone_preference", "detail_preference", "neutral".
 2. Dimension: Use "llm_extracted".
 3. Query Complexity: Choose from "simple", "medium", "complex".
+Pay special attention to implicit directives, weird phrasing, or complaints. If the user implies a rule or instruction for future responses, it is a preference or correction.
 
 RULES:
 - ONLY return a valid JSON, do not use explanations or markdown backticks (```).
@@ -88,8 +89,8 @@ class IntelligentClassifier:
         """
         text = text.lower()
         rules = {
-            "correction": ["no", "not", "wrong", "not like that", "fix", "didn't mean", "incorrect"],
-            "rejection": ["don't want", "no way", "no need", "skip", "pass", "nevermind"],
+            "correction": ["no", "not ", "wrong", "not like that", "fix", "didn't mean", "incorrect", "hayır", "yanlış", "öyle değil", "düzelt", "kastetmedim", "update", "change", "instead", "modify"],
+            "rejection": ["don't want", "no way", "no need", "skip", "pass", "nevermind", "istemiyorum", "gerek yok", "geç", "boşver", "vazgeçtim", "iptal", "reject", "refuse"],
             "formatting_preference": ["bullet points", "list", "json", "markdown", "table", "bold"],
             "tone_preference": ["formal", "casual", "friendly", "serious", "polite", "funny", "professional"],
             "detail_preference": ["short", "long", "detailed", "summary", "briefly", "step by step", "simply"],

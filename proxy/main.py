@@ -115,8 +115,16 @@ async def log_telemetry(
     project_events_key = f"project:{project_id}:events"
 
     try:
-        correction_patterns = [r"\bno\b", r"\bnot\b", r"\bwrong\b", r"\bnot like that\b", r"\bfix\b"]
-        rejection_patterns = [r"\bignore\b", r"\bforget\b", r"\bstart over\b", r"\bcancel\b", r"\bstop\b"]
+        correction_patterns = [
+            r"\bno\b", r"\bnot\b", r"\bwrong\b", r"\bnot like that\b", r"\bfix\b",
+            r"\bhay[ıi]r\b", r"\byanl[ıi][sş]\b", r"\b[oö]yle de[gğ]il\b", r"\bd[uü]zelt\b",
+            r"\bupdate\b", r"\bchange\b", r"\binstead\b", r"\bmodify\b"
+        ]
+        rejection_patterns = [
+            r"\bignore\b", r"\bforget\b", r"\bstart over\b", r"\bcancel\b", r"\bstop\b",
+            r"\bbo[sş]ver\b", r"\biptal\b", r"\bgerek yok\b",
+            r"\breject\b", r"\brefuse\b"
+        ]
 
         last_msg_str = str(last_user_msg).lower()
         is_correction = any(re.search(p, last_msg_str) for p in correction_patterns)

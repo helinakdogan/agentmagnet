@@ -16,12 +16,18 @@ CORRECTION_PATTERNS = [
     r"\bno\b", r"\bnot\b", r"\bwrong\b", r"\bagain\b",
     r"\bnot like that\b", r"\bdidn't mean\b", r"\bnot (that|what)\b",
     r"\bthat'?s? (not|wrong)\b", r"\bno,?\s+i\b", r"\bi (didn'?t|don'?t) mean\b",
+    r"\bhay[ıi]r\b", r"\byanl[ıi][sş]\b", r"\b[oö]yle de[gğ]il\b", r"\bd[uü]zelt\b",
+    r"\bkastetmedim\b", r"\bb[oö]yle istemedim\b", r"\bhatal[ıi]\b",
+    r"\bupdate\b", r"\bchange\b", r"\binstead\b", r"\bmodify\b"
 ]
 
 REJECTION_PATTERNS = [
     r"\bdon't want\b", r"\bno way\b", r"\bno need\b", r"\bskip\b",
     r"\bskip\b", r"\bno thanks?\b", r"\bnot (now|this|that)\b",
     r"\bi('ll)? pass\b", r"\bnevermind\b",
+    r"\bistemiyorum\b", r"\bgerek yok\b", r"\bge[cç]\b", r"\bbo[sş]ver\b",
+    r"\bvazge[cç]tim\b", r"\biptal\b", r"\bistemem\b",
+    r"\breject\b", r"\brefuse\b"
 ]
 
 _CORRECTION_RE = re.compile("|".join(CORRECTION_PATTERNS), re.IGNORECASE)
