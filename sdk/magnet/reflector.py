@@ -27,9 +27,8 @@ OUTPUT FORMAT (only JSON, write nothing else):
     "formatting": {"value": "markdown", "confidence": 0.80}
   },
   "contextual_profiles": {
-    "coding": {
-      "response_length": {"value": "short", "confidence": 0.9},
-      "explanation_depth": {"value": "low", "confidence": 0.85}
+    "react_development": {
+      "response_length": {"value": "short", "confidence": 0.9}
     }
   }
 }
@@ -38,10 +37,13 @@ RULES:
 - Provide a value (string) and confidence (float between 0.0 - 1.0) for each preference.
 - Her preference için 0.0-1.0 arası confidence score ver. 1 sinyal = 0.3, 3 sinyal = 0.6, 5+ sinyal = 0.85+
 - Only extract preferences explicitly stated in the signal. Do not add contexts and preferences not present in the signal.
+- For `contextual_profiles`, group related topics into cohesive, broad technical/business domains (e.g., use 'react_development' instead of fragmenting into 'react_hooks' or 'react_components').
+- REUSE "Existing Contexts" provided below if the new signals fit into them. Only create a new key if the topic is entirely different.
 - Never guess or hallucinate.
 """
 
 _USER_TEMPLATE = """User ID: {user_id}
+Existing Contexts: {existing_contexts}
 Signal count: {signal_count}
 Signals:
 {signals_json}
@@ -88,8 +90,12 @@ class Reflector:
             for key in current_state.get("confidence_scores", {}):
                 current_state["confidence_scores"][key] *= decay_factor
 
+        existing_contexts_list = list(current_state.get("contextual_profiles", {}).keys())
+        existing_contexts_str = ", ".join(existing_contexts_list) if existing_contexts_list else "None"
+
         prompt = _USER_TEMPLATE.format(
             user_id=user_id,
+            existing_contexts=existing_contexts_str,
             signal_count=len(signals),
             signals_json=json.dumps(signals, ensure_ascii=False, indent=2),
         )
@@ -238,9 +244,7 @@ class Reflector:
     def _empty_profile() -> dict:
         return {
             "global_preferences": {},
-            "contextual_profiles": {
-                "coding": {}, "business_strategy": {}, "writing": {}, "learning": {}, "general_chat": {}
-            },
+            "contextual_profiles": {},
             "confidence_scores": {},
             "reflected_at": None,
             "signal_count": 0,
@@ -262,8 +266,7 @@ class Reflector:
                     "response_length": prefs.get("response_length", "unknown"),
                     "explanation_depth": prefs.get("detail_level", "unknown"),
                     "tone": "unknown"
-                },
-                "coding": {}, "business_strategy": {}, "writing": {}, "learning": {}
+                }
             },
             "confidence_scores": {},
             "reflected_at": profile.get("reflected_at", time.time()),

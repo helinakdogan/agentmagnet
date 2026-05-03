@@ -24,9 +24,13 @@ class ProfileStore:
 
     def save(self, user_id: str, profile: dict) -> None:
         key = _PROFILE_PREFIX + user_id
+        history_key = f"vmm:profile_history:{user_id}"
         data = json.dumps(profile, ensure_ascii=False)
         if self._redis:
             self._redis.setex(key, self.ttl, data)
+            # Log history to track profile evolution (max 50 history entries)
+            self._redis.lpush(history_key, data)
+            self._redis.ltrim(history_key, 0, 49)
         else:
             self._memory[key] = profile
         logger.debug(f"Profile saved: {user_id}")

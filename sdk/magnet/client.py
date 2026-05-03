@@ -301,7 +301,8 @@ class BehavioralMemory:
         if current_messages:
             user_msgs = [m["content"] for m in current_messages if m.get("role") == "user"]
             if user_msgs:
-                current_context = ContextClassifier.detect(user_msgs[-1])
+                dynamic_contexts = list(profile.get("contextual_profiles", {}).keys())
+                current_context = ContextClassifier.detect(user_msgs[-1], dynamic_contexts)
 
         return self._reflector.build_injection(profile, current_context)
 
