@@ -50,6 +50,7 @@ vmm_memory = BehavioralMemory(
     openai_api_key=os.getenv("OPENAI_API_KEY"),
     redis_client=r_sync,
     signal_threshold=3,
+    enable_aggregate=True,
 )
 
 # Cost-per-token lookup (input token price in USD)

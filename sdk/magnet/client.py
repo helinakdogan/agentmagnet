@@ -22,6 +22,7 @@ from .store import ProfileStore
 from .classifier import IntelligentClassifier
 from .classifier import ContextClassifier
 from .router import ModelRouter, RouterDecision
+from .aggregate_store import AggregateSignalStore
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ class BehavioralMemory:
         router: ModelRouter | None = None,
         qdrant_url: str | None = None,
         qdrant_api_key: str | None = None,
+        enable_aggregate: bool = True,
         # Legacy parameters — silently ignored for backwards compatibility
         api_key: str | None = None,
         use_mem0: bool = False,
@@ -96,6 +98,11 @@ class BehavioralMemory:
             fallback_rules=True,
         )
         self._store = ProfileStore(redis_client=redis_client)
+        
+        if enable_aggregate and redis_client:
+            self._aggregate = AggregateSignalStore(redis_client)
+        else:
+            self._aggregate = None
 
     def add(
         self,
@@ -149,6 +156,18 @@ class BehavioralMemory:
                 signals = self._detector.detect(messages=messages, session_id=sid, metadata=metadata)
 
             if signals:
+                if self._aggregate:
+                    user_msgs = [m for m in messages if m.get("role") == "user"]
+                    last_user_msg = user_msgs[-1].get("content", "") if user_msgs else ""
+                    for signal in signals:
+                        if signal.get("type") in ("correction", "rejection", "preference", "clarification", "positive"):
+                            category = self._classify_category_local(last_user_msg)
+                            self._aggregate.record(
+                                signal_type=signal["type"],
+                                query_category=category,
+                                dimension=signal.get("dimension", "unknown"),
+                                dimension_value=self._extract_dimension_value(signal),
+                            )
                 count = self._buffer.push(tenant_id, signals)
                 logger.debug(f"add(): {len(signals)} signals added, total={count}")
                 if self._buffer.should_reflect(tenant_id):
@@ -219,6 +238,18 @@ class BehavioralMemory:
                 signals = self._detector.detect(messages=messages, session_id=sid, metadata=metadata)
 
             if signals:
+                if self._aggregate:
+                    user_msgs = [m for m in messages if m.get("role") == "user"]
+                    last_user_msg = user_msgs[-1].get("content", "") if user_msgs else ""
+                    for signal in signals:
+                        if signal.get("type") in ("correction", "rejection", "preference", "clarification", "positive"):
+                            category = self._classify_category_local(last_user_msg)
+                            self._aggregate.record(
+                                signal_type=signal["type"],
+                                query_category=category,
+                                dimension=signal.get("dimension", "unknown"),
+                                dimension_value=self._extract_dimension_value(signal),
+                            )
                 count = self._buffer.push(tenant_id, signals)
                 logger.debug(f"async_add(): {len(signals)} signals added, total={count}")
                 if self._buffer.should_reflect(tenant_id):
@@ -294,15 +325,21 @@ class BehavioralMemory:
         """
         tenant_id = f"{project_id}:{user_id}"
         profile = self._store.load(tenant_id)
-        if not profile:
-            return ""
 
         current_context = "general_chat"
         if current_messages:
             user_msgs = [m["content"] for m in current_messages if m.get("role") == "user"]
             if user_msgs:
-                dynamic_contexts = list(profile.get("contextual_profiles", {}).keys())
-                current_context = ContextClassifier.detect(user_msgs[-1], dynamic_contexts)
+                if profile:
+                    dynamic_contexts = list(profile.get("contextual_profiles", {}).keys())
+                    current_context = ContextClassifier.detect(user_msgs[-1], dynamic_contexts)
+                else:
+                    current_context = self._classify_category_local(user_msgs[-1])
+
+        if not profile:
+            if self._aggregate:
+                return self._aggregate.get_cold_start_injection(current_context)
+            return ""
 
         return self._reflector.build_injection(profile, current_context)
 
@@ -351,3 +388,29 @@ class BehavioralMemory:
             logger.info(f"Reflect completed: {tenant_id}")
         except Exception as e:
             logger.error(f"Reflect error ({tenant_id}): {e}")
+
+    def _classify_category_local(self, text: str) -> str:
+        """
+        Simple keyword matching — no LLM involved, zero cost.
+        Privacy: The actual text content is never sent to the aggregate store, only the category.
+        """
+        text_lower = text.lower()
+        if any(kw in text_lower for kw in ["kod", "code", "python", "javascript", "sql", "bug", "hata"]):
+            return "coding"
+        if any(kw in text_lower for kw in ["analiz", "rapor", "veri", "analysis", "data"]):
+            return "analysis"
+        if any(kw in text_lower for kw in ["yaz", "makale", "blog", "write", "essay"]):
+            return "writing"
+        if any(kw in text_lower for kw in ["öğren", "anlat", "explain", "nedir", "what is"]):
+            return "learning"
+        return "general_chat"
+
+    def _extract_dimension_value(self, signal: dict) -> str:
+        """Extracts the dimension value based on the signal type."""
+        if signal.get("type") == "correction":
+            msg = signal.get("message", "").lower()
+            if any(kw in msg for kw in ["kısa", "short", "özet", "brief"]):
+                return "short"
+            if any(kw in msg for kw in ["uzun", "long", "detaylı", "detailed"]):
+                return "long"
+        return "unknown"

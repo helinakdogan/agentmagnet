@@ -35,7 +35,7 @@ OUTPUT FORMAT (only JSON, write nothing else):
 
 RULES:
 - Provide a value (string) and confidence (float between 0.0 - 1.0) for each preference.
-- Her preference için 0.0-1.0 arası confidence score ver. 1 sinyal = 0.3, 3 sinyal = 0.6, 5+ sinyal = 0.85+
+- Assign a confidence score between 0.0-1.0 for each preference (e.g., 1 signal = 0.3, 3 signals = 0.6, 5+ signals = 0.85+).
 - Only extract preferences explicitly stated in the signal. Do not add contexts and preferences not present in the signal.
 - For `contextual_profiles`, group related topics into cohesive, broad technical/business domains (e.g., use 'react_development' instead of fragmenting into 'react_hooks' or 'react_components').
 - REUSE "Existing Contexts" provided below if the new signals fit into them. Only create a new key if the topic is entirely different.
@@ -86,7 +86,7 @@ class Reflector:
         last_reflected = current_state.get("reflected_at")
         if last_reflected:
             days_elapsed = (now - last_reflected) / 86400
-            decay_factor = max(0.5, 1.0 - (days_elapsed * 0.02))  # günde %2 düşüş
+            decay_factor = max(0.5, 1.0 - (days_elapsed * 0.02))  # 2% decay per day
             for key in current_state.get("confidence_scores", {}):
                 current_state["confidence_scores"][key] *= decay_factor
 
@@ -188,12 +188,12 @@ class Reflector:
 
     def _merge_state(self, current: dict, updates: dict, is_correction: bool = False) -> dict:
         """
-        Eğer existing_profile varsa:
-        Yeni sinyaller existing_profile'ı tamamen ezmez.
-        Bunun yerine merge et:
-        - Aynı preference key varsa: confidence = max(mevcut, yeni)
-        - Yeni key ise: ekle
-        - Düzeltme sinyali ise: ilgili key'in confidence'ını düşür (-0.2)
+        If an existing_profile is present:
+        New signals do not completely overwrite the existing_profile.
+        Instead, perform a merge:
+        - If the same preference key exists: confidence = max(current, new)
+        - If it's a new key: add it
+        - If it's a correction signal: reduce the confidence of the related key (-0.2)
         """
         confidence_scores = current.setdefault("confidence_scores", {})
         
