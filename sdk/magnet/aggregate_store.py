@@ -71,7 +71,7 @@ class AggregateSignalStore:
         except Exception:
             pass
 
-    def get_prior(self, query_category: str, dimension: str) -> dict | None:
+    def get_prior(self, query_category: str, dimension: str) -> Any:
         """
         Returns the aggregate prior probability for a new user.
         K-anonymity: Returns None if total records < min_k.

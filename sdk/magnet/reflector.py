@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-import litellm
+import litellm  # type: ignore
 
 logger = logging.getLogger(__name__)
 

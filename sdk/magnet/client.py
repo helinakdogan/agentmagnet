@@ -1,11 +1,17 @@
 """
 BehavioralMemory
 ----------------
-Behavioral memory layer with BYOK (Bring Your Own Key) support.
+A behavioral memory client using a 3-Layered Hybrid Memory Architecture.
 
-This is the main client-facing class. It provides intelligent behavioral
-learning capabilities including signal detection, reflection, and model routing.
-No third-party memory provider dependency required.
+Layers:
+  Layer 1 — Behavioral : Redis + ProfileStore + SignalBuffer + Reflector
+             Runs on every request.
+  Layer 2 — Episodic   : EpisodicStore (Qdrant or Redis fallback)
+             Long-term memory for important conversations.
+  Layer 3 — Knowledge  : KnowledgeStore
+             Graph-based entity memory.
+
+Supports BYOK (Bring Your Own Key). No third-party memory provider dependencies.
 """
 
 from __future__ import annotations
@@ -23,31 +29,36 @@ from .classifier import IntelligentClassifier
 from .classifier import ContextClassifier
 from .router import ModelRouter, RouterDecision
 from .aggregate_store import AggregateSignalStore
+from .episodic_store import EpisodicStore
+from .knowledge_store import KnowledgeStore
+from .memory_orchestrator import MemoryOrchestrator
 
 logger = logging.getLogger(__name__)
 
 
 class BehavioralMemory:
     """
-    A memory client that learns from user behavior.
+    A memory client that learns from user behavior using a 3-tiered hybrid architecture.
 
-    This class provides a behavioral layer that observes user interactions,
-    extracts signals, and builds a dynamic user profile to personalize
-    future responses. All processing happens within your own infrastructure.
+    The Behavioral layer runs on every request. The Episodic layer saves important conversations
+    into long-term memory and activates automatically for queries referencing the past.
+    The Knowledge layer provides graph-based memory capabilities.
 
     Args:
-        openai_api_key (str, optional): BYOK — OpenAI API key for the Reflector LLM.
+        openai_api_key (str, optional): BYOK — OpenAI API key.
             Falls back to OPENAI_API_KEY environment variable if not provided.
-        anthropic_api_key (str, optional): BYOK — Anthropic API key (alternative).
+        anthropic_api_key (str, optional): BYOK — Anthropic API key.
             Falls back to ANTHROPIC_API_KEY environment variable if not provided.
         redis_client (Any, optional): An initialized Redis client for persistence.
         signal_threshold (int): Number of signals to buffer before triggering reflection.
         reflector_model (str): The LLM to use for the reflection process.
         classifier_model (str): The LLM to use for the classification fallback.
         router (ModelRouter, optional): An instance of ModelRouter for dynamic model selection.
-        qdrant_url (str, optional): Qdrant vector DB URL for long-term storage (optional).
+        qdrant_url (str, optional): Qdrant vector DB URL for episodic layer (optional).
         qdrant_api_key (str, optional): Qdrant API key.
+        enable_aggregate (bool): Enable aggregate signal tracking.
     """
+
     def __init__(
         self,
         openai_api_key: str | None = None,
@@ -85,6 +96,7 @@ class BehavioralMemory:
         if kwargs:
             logger.warning(f"BehavioralMemory: unknown parameters ignored: {list(kwargs.keys())}")
 
+        # ── Layer 1: Behavioral ───────────────────────────────────────
         self._detector = SignalDetector(param_change_threshold=3, redis_client=redis_client)
         self._buffer = SignalBuffer(redis_client=redis_client, threshold=signal_threshold)
         self._reflector = Reflector(
@@ -98,11 +110,40 @@ class BehavioralMemory:
             fallback_rules=True,
         )
         self._store = ProfileStore(redis_client=redis_client)
-        
+
         if enable_aggregate and redis_client:
             self._aggregate = AggregateSignalStore(redis_client)
         else:
             self._aggregate = None
+
+        # ── Layer 2: Episodic ─────────────────────────────────────────
+        _qdrant_url = qdrant_url or os.environ.get("QDRANT_URL")
+        _qdrant_api_key = qdrant_api_key or os.environ.get("QDRANT_API_KEY")
+        self._episodic = EpisodicStore(
+            redis_client=redis_client,
+            qdrant_url=_qdrant_url,
+            qdrant_api_key=_qdrant_api_key,
+        )
+
+        # ── Layer 3: Knowledge ────────────────────────────────────────
+        _neo4j_url = os.environ.get("NEO4J_URL")
+        _neo4j_auth_str = os.environ.get("NEO4J_AUTH")
+        _neo4j_auth = None
+        if _neo4j_auth_str and "/" in _neo4j_auth_str:
+            user, pwd = _neo4j_auth_str.split("/", 1)
+            _neo4j_auth = (user, pwd)
+            
+        self._knowledge = KnowledgeStore(
+            neo4j_url=_neo4j_url,
+            neo4j_auth=_neo4j_auth,
+        )
+
+        # ── Memory Orchestrator ───────────────────────────────────────
+        self._orchestrator = MemoryOrchestrator(
+            behavioral_store=self._store,
+            episodic_store=self._episodic,
+            knowledge_store=self._knowledge,
+        )
 
     def add(
         self,
@@ -139,7 +180,10 @@ class BehavioralMemory:
                     last_msg = user_msgs[-1].get("content", "")
                     context_msgs = messages[:-1] if len(messages) > 1 else []
                     cls_res = self.classifier.classify(context_msgs, last_msg)
-                    if cls_res.signal_type in ("correction", "rejection", "preference", "formatting_preference", "tone_preference", "detail_preference"):
+                    if cls_res.signal_type in (
+                        "correction", "rejection", "preference",
+                        "formatting_preference", "tone_preference", "detail_preference",
+                    ):
                         signals.append(
                             {
                                 "type": cls_res.signal_type,
@@ -153,14 +197,19 @@ class BehavioralMemory:
                     if param_sig:
                         signals.append(param_sig)
             else:
-                signals = self._detector.detect(messages=messages, session_id=sid, metadata=metadata)
+                signals = self._detector.detect(
+                    messages=messages, session_id=sid, metadata=metadata
+                )
 
             if signals:
                 if self._aggregate:
                     user_msgs = [m for m in messages if m.get("role") == "user"]
                     last_user_msg = user_msgs[-1].get("content", "") if user_msgs else ""
                     for signal in signals:
-                        if signal.get("type") in ("correction", "rejection", "preference", "clarification", "positive"):
+                        if signal.get("type") in (
+                            "correction", "rejection", "preference",
+                            "clarification", "positive",
+                        ):
                             category = self._classify_category_local(last_user_msg)
                             self._aggregate.record(
                                 signal_type=signal["type"],
@@ -178,11 +227,23 @@ class BehavioralMemory:
                         signals_to_reflect = self._buffer.flush(tenant_id)
                         if signals_to_reflect:
                             import threading
+
                             t = threading.Thread(
-                                target=lambda: asyncio.run(self._do_reflect(tenant_id, signals_to_reflect)),
+                                target=lambda: asyncio.run(
+                                    self._do_reflect(tenant_id, signals_to_reflect)
+                                ),
                                 daemon=True,
                             )
                             t.start()
+
+            # ── Episodic storage decision ─────────────────────────────────
+            importance = self._orchestrator.should_store_episode(messages, signals)
+            if importance >= 0.7:
+                self._episodic.store_episode(
+                    tenant_id=tenant_id,
+                    messages=messages,
+                    importance=importance,
+                )
 
             if self.router:
                 profile = self.get_profile(user_id, project_id)
@@ -191,7 +252,7 @@ class BehavioralMemory:
                     "selected_model": routing_decision.selected_model,
                     "reason": routing_decision.reason,
                     "confidence": routing_decision.confidence,
-                    "cost_tier": routing_decision.cost_tier
+                    "cost_tier": routing_decision.cost_tier,
                 }
         except Exception as e:
             logger.error(f"Behavioral add error: {e}")
@@ -220,8 +281,13 @@ class BehavioralMemory:
                 if user_msgs:
                     last_msg = user_msgs[-1].get("content", "")
                     context_msgs = messages[:-1] if len(messages) > 1 else []
-                    cls_res = await asyncio.to_thread(self.classifier.classify, context_msgs, last_msg)
-                    if cls_res.signal_type in ("correction", "rejection", "preference", "formatting_preference", "tone_preference", "detail_preference"):
+                    cls_res = await asyncio.to_thread(
+                        self.classifier.classify, context_msgs, last_msg
+                    )
+                    if cls_res.signal_type in (
+                        "correction", "rejection", "preference",
+                        "formatting_preference", "tone_preference", "detail_preference",
+                    ):
                         signals.append(
                             {
                                 "type": cls_res.signal_type,
@@ -235,14 +301,19 @@ class BehavioralMemory:
                     if param_sig:
                         signals.append(param_sig)
             else:
-                signals = self._detector.detect(messages=messages, session_id=sid, metadata=metadata)
+                signals = self._detector.detect(
+                    messages=messages, session_id=sid, metadata=metadata
+                )
 
             if signals:
                 if self._aggregate:
                     user_msgs = [m for m in messages if m.get("role") == "user"]
                     last_user_msg = user_msgs[-1].get("content", "") if user_msgs else ""
                     for signal in signals:
-                        if signal.get("type") in ("correction", "rejection", "preference", "clarification", "positive"):
+                        if signal.get("type") in (
+                            "correction", "rejection", "preference",
+                            "clarification", "positive",
+                        ):
                             category = self._classify_category_local(last_user_msg)
                             self._aggregate.record(
                                 signal_type=signal["type"],
@@ -255,6 +326,17 @@ class BehavioralMemory:
                 if self._buffer.should_reflect(tenant_id):
                     await self._reflect_async(tenant_id)
 
+            # ── Episodic storage decision ─────────────────────────────────
+            importance = self._orchestrator.should_store_episode(messages, signals)
+            if importance >= 0.7:
+                await asyncio.to_thread(
+                    self._episodic.store_episode,
+                    tenant_id,
+                    messages,
+                    None,
+                    importance,
+                )
+
             if self.router:
                 profile = self.get_profile(user_id, project_id)
                 routing_decision = self.router.route(messages, profile)
@@ -262,14 +344,21 @@ class BehavioralMemory:
                     "selected_model": routing_decision.selected_model,
                     "reason": routing_decision.reason,
                     "confidence": routing_decision.confidence,
-                    "cost_tier": routing_decision.cost_tier
+                    "cost_tier": routing_decision.cost_tier,
                 }
         except Exception as e:
             logger.error(f"Behavioral async_add error: {e}")
 
         return result
 
-    def search(self, query: str, user_id: str, project_id: str = "default", limit: int = 10, **kwargs) -> dict:
+    def search(
+        self,
+        query: str,
+        user_id: str,
+        project_id: str = "default",
+        limit: int = 10,
+        **kwargs,
+    ) -> dict:
         """
         Returns behavioral context for a user based on their learned profile.
 
@@ -316,32 +405,53 @@ class BehavioralMemory:
         self._profile_cache[tenant_id] = (profile, now)
         return profile
 
-    def get_injection(self, user_id: str, project_id: str = "default", current_messages: list[dict] | None = None) -> str:
+    def get_injection(
+        self,
+        user_id: str,
+        project_id: str = "default",
+        current_messages: list[dict] | None = None,
+    ) -> str:
         """
-        Generates a system prompt injection string based on the user's profile.
+        Generates a system prompt injection based on the user's profile and current conversation.
 
-        This method analyzes the context of the current messages to select the
-        most relevant parts of the user's profile for injection.
+        Operates via the Orchestrator:
+          - Behavioral context is always included.
+          - Episodic context is added if the query references past interactions.
+          - Knowledge context is currently bypassed.
+
+        Args:
+            user_id:          User ID.
+            project_id:       Project ID (default: "default").
+            current_messages: Current conversation messages.
+
+        Returns:
+            Combined context string. Returns aggregate cold-start if no profile exists.
         """
         tenant_id = f"{project_id}:{user_id}"
-        profile = self._store.load(tenant_id)
 
-        current_context = "general_chat"
+        # Use the last user message as the query
+        query = ""
         if current_messages:
-            user_msgs = [m["content"] for m in current_messages if m.get("role") == "user"]
-            if user_msgs:
-                if profile:
-                    dynamic_contexts = list(profile.get("contextual_profiles", {}).keys())
-                    current_context = ContextClassifier.detect(user_msgs[-1], dynamic_contexts)
-                else:
-                    current_context = self._classify_category_local(user_msgs[-1])
+            user_msgs = [
+                m["content"]
+                for m in current_messages
+                if m.get("role") == "user" and m.get("content")
+            ]
+            query = user_msgs[-1] if user_msgs else ""
 
+        # Cold-start fallback if no profile exists
+        profile = self._store.load(tenant_id)
         if not profile:
             if self._aggregate:
+                current_context = self._classify_category_local(query) if query else "general_chat"
                 return self._aggregate.get_cold_start_injection(current_context)
             return ""
 
-        return self._reflector.build_injection(profile, current_context)
+        return self._orchestrator.build_context(
+            query=query,
+            tenant_id=tenant_id,
+            current_messages=current_messages,
+        )
 
     def force_reflect(self, user_id: str, project_id: str = "default") -> dict:
         """
@@ -358,12 +468,19 @@ class BehavioralMemory:
         self._profile_cache.pop(tenant_id, None)
         return profile
 
-    def get_pending_signals(self, user_id: str, project_id: str = "default") -> list[dict]:
+    def get_pending_signals(
+        self, user_id: str, project_id: str = "default"
+    ) -> list[dict]:
         """Returns the list of signals currently in the buffer for a user."""
         tenant_id = f"{project_id}:{user_id}"
         return self._buffer.peek(tenant_id)
 
-    def get_recommended_model(self, user_id: str, messages: list[dict], project_id: str = "default") -> RouterDecision | None:
+    def get_recommended_model(
+        self,
+        user_id: str,
+        messages: list[dict],
+        project_id: str = "default",
+    ) -> RouterDecision | None:
         """Recommends the optimal model for a given request using the router."""
         if not self.router:
             return None
@@ -382,7 +499,9 @@ class BehavioralMemory:
     async def _do_reflect(self, tenant_id: str, signals: list[dict]) -> None:
         try:
             existing_profile = await asyncio.to_thread(self._store.load, tenant_id)
-            profile = await asyncio.to_thread(self._reflector.reflect, tenant_id, signals, existing_profile)
+            profile = await asyncio.to_thread(
+                self._reflector.reflect, tenant_id, signals, existing_profile
+            )
             await asyncio.to_thread(self._store.save, tenant_id, profile)
             self._profile_cache.pop(tenant_id, None)
             logger.info(f"Reflect completed: {tenant_id}")

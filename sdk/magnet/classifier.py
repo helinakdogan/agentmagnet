@@ -12,7 +12,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Any
-import litellm
+import litellm  # type: ignore
 from .signals import _CORRECTION_RE, _REJECTION_RE
 
 logger = logging.getLogger(__name__)
