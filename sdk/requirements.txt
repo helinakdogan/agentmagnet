@@ -6,3 +6,5 @@ uvicorn
 requests
 supabase
 numpy
+qdrant-client>=1.7.0
+neo4j>=5.14.0

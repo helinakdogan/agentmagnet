@@ -11,6 +11,8 @@ dependencies = [
     "redis>=5.0",
     "python-dotenv>=1.0",
     "litellm>=1.40.0",
+    "qdrant-client>=1.7.0",
+    "neo4j>=5.14.0",
 ]
 
 [project.optional-dependencies]
