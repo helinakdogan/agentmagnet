@@ -129,14 +129,34 @@ class BehavioralMemory:
         _neo4j_url = os.environ.get("NEO4J_URL")
         _neo4j_auth_str = os.environ.get("NEO4J_AUTH")
         _neo4j_auth = None
-        if _neo4j_auth_str and "/" in _neo4j_auth_str:
-            user, pwd = _neo4j_auth_str.split("/", 1)
-            _neo4j_auth = (user, pwd)
-            
+        if _neo4j_auth_str:
+            # Support both formats:
+            #   user/password  (simple)
+            #   ("user", "password")  (tuple string from env)
+            clean = _neo4j_auth_str.strip().strip('()\'"')
+            # Remove tuple syntax if present: ("7f3e0cec", "password")
+            if '",' in clean or "'," in clean:
+                import re as _re
+                parts = _re.findall(r'["\']([^"\']+)["\']', _neo4j_auth_str)
+                if len(parts) == 2:
+                    _neo4j_auth = (parts[0], parts[1])
+            elif "/" in clean:
+                user, pwd = clean.split("/", 1)
+                _neo4j_auth = (user.strip(), pwd.strip())
+
         self._knowledge = KnowledgeStore(
             neo4j_url=_neo4j_url,
             neo4j_auth=_neo4j_auth,
+            redis_client=redis_client,
         )
+
+        # Threshold values for dynamic signal learning
+        # Strong semantic signals (like/dislike) are instant — no buffering needed
+        self._instant_signal_types = {
+            "preference_dislike", "preference_like", "tone_preference",
+        }
+        # Soft signals still buffer until threshold
+        self._soft_signal_threshold = signal_threshold
 
         # ── Memory Orchestrator ───────────────────────────────────────
         self._orchestrator = MemoryOrchestrator(
@@ -180,18 +200,46 @@ class BehavioralMemory:
                     last_msg = user_msgs[-1].get("content", "")
                     context_msgs = messages[:-1] if len(messages) > 1 else []
                     cls_res = self.classifier.classify(context_msgs, last_msg)
-                    if cls_res.signal_type in (
-                        "correction", "rejection", "preference",
-                        "formatting_preference", "tone_preference", "detail_preference",
-                    ):
-                        signals.append(
-                            {
-                                "type": cls_res.signal_type,
-                                "message": last_msg[:200],
-                                "confidence": cls_res.confidence,
+                    if cls_res.signal_type not in ("neutral",):
+                        signal_entry = {
+                            "type": cls_res.signal_type,
+                            "message": last_msg[:200],
+                            "confidence": cls_res.confidence,
+                            "dimension": cls_res.dimension,
+                            "extracted_preference": cls_res.extracted_preference,
+                        }
+                        signals.append(signal_entry)
+
+                        # ── INSTANT LEARNING: strong signals bypass buffer ──
+                        if cls_res.signal_type in self._instant_signal_types and cls_res.extracted_preference:
+                            existing_profile = self._store.load(tenant_id)
+                            updated_profile = self._reflector.instant_learn(
+                                user_id=tenant_id,
+                                signal_type=cls_res.signal_type,
+                                extracted_preference=cls_res.extracted_preference,
+                                confidence=cls_res.confidence,
+                                existing_profile=existing_profile,
+                            )
+                            self._store.save(tenant_id, updated_profile)
+                            self._profile_cache.pop(tenant_id, None)
+
+                            # Also store in Knowledge Layer (Layer 3)
+                            entity_type = (
+                                "dislike" if cls_res.signal_type == "preference_dislike"
+                                else "like" if cls_res.signal_type == "preference_like"
+                                else "personality"
+                            )
+                            self._knowledge.store_entity(tenant_id, {
+                                "type": entity_type,
+                                "content": cls_res.extracted_preference,
                                 "dimension": cls_res.dimension,
-                            }
-                        )
+                                "confidence": cls_res.confidence,
+                            })
+                            logger.info(
+                                f"add(): instant_learn [{cls_res.signal_type}] for {tenant_id}: "
+                                f"{cls_res.extracted_preference!r} (conf={cls_res.confidence:.2f})"
+                            )
+
                 if metadata:
                     param_sig = self._detector._check_param_change(sid, metadata)
                     if param_sig:
@@ -209,6 +257,7 @@ class BehavioralMemory:
                         if signal.get("type") in (
                             "correction", "rejection", "preference",
                             "clarification", "positive",
+                            "preference_dislike", "preference_like",
                         ):
                             category = self._classify_category_local(last_user_msg)
                             self._aggregate.record(
@@ -238,7 +287,7 @@ class BehavioralMemory:
 
             # ── Episodic storage decision ─────────────────────────────────
             importance = self._orchestrator.should_store_episode(messages, signals)
-            if importance >= 0.7:
+            if importance >= 0.5:  # Lowered from 0.7 — more conversations captured
                 self._episodic.store_episode(
                     tenant_id=tenant_id,
                     messages=messages,
@@ -284,18 +333,51 @@ class BehavioralMemory:
                     cls_res = await asyncio.to_thread(
                         self.classifier.classify, context_msgs, last_msg
                     )
-                    if cls_res.signal_type in (
-                        "correction", "rejection", "preference",
-                        "formatting_preference", "tone_preference", "detail_preference",
-                    ):
-                        signals.append(
-                            {
-                                "type": cls_res.signal_type,
-                                "message": last_msg[:200],
-                                "confidence": cls_res.confidence,
-                                "dimension": cls_res.dimension,
-                            }
-                        )
+                    if cls_res.signal_type not in ("neutral",):
+                        signal_entry = {
+                            "type": cls_res.signal_type,
+                            "message": last_msg[:200],
+                            "confidence": cls_res.confidence,
+                            "dimension": cls_res.dimension,
+                            "extracted_preference": cls_res.extracted_preference,
+                        }
+                        signals.append(signal_entry)
+
+                        # ── INSTANT LEARNING: strong signals bypass buffer ──
+                        if cls_res.signal_type in self._instant_signal_types and cls_res.extracted_preference:
+                            existing_profile = await asyncio.to_thread(self._store.load, tenant_id)
+                            updated_profile = await asyncio.to_thread(
+                                self._reflector.instant_learn,
+                                tenant_id,
+                                cls_res.signal_type,
+                                cls_res.extracted_preference,
+                                cls_res.confidence,
+                                existing_profile,
+                            )
+                            await asyncio.to_thread(self._store.save, tenant_id, updated_profile)
+                            self._profile_cache.pop(tenant_id, None)
+
+                            # Also store in Knowledge Layer (Layer 3)
+                            entity_type = (
+                                "dislike" if cls_res.signal_type == "preference_dislike"
+                                else "like" if cls_res.signal_type == "preference_like"
+                                else "personality"
+                            )
+                            await asyncio.to_thread(
+                                self._knowledge.store_entity,
+                                tenant_id,
+                                {
+                                    "type": entity_type,
+                                    "content": cls_res.extracted_preference,
+                                    "dimension": cls_res.dimension,
+                                    "confidence": cls_res.confidence,
+                                },
+                            )
+                            logger.info(
+                                f"async_add(): instant_learn [{cls_res.signal_type}] for {tenant_id}: "
+                                f"{cls_res.extracted_preference!r} (conf={cls_res.confidence:.2f})"
+                            )
+
                 if metadata:
                     param_sig = self._detector._check_param_change(sid, metadata)
                     if param_sig:
@@ -313,6 +395,7 @@ class BehavioralMemory:
                         if signal.get("type") in (
                             "correction", "rejection", "preference",
                             "clarification", "positive",
+                            "preference_dislike", "preference_like",
                         ):
                             category = self._classify_category_local(last_user_msg)
                             self._aggregate.record(
@@ -328,7 +411,7 @@ class BehavioralMemory:
 
             # ── Episodic storage decision ─────────────────────────────────
             importance = self._orchestrator.should_store_episode(messages, signals)
-            if importance >= 0.7:
+            if importance >= 0.5:  # Lowered from 0.7
                 await asyncio.to_thread(
                     self._episodic.store_episode,
                     tenant_id,

@@ -120,7 +120,7 @@ class MemoryOrchestrator:
         decision = self.decide(query, tenant_id)
         context_parts: list[str] = []
 
-        # ── Layer 1: Behavioral (always active) ───────────────────────
+        # ── Layer 1: Behavioral (always active) ────────────────────────
         if decision["behavioral"]:
             profile = self._behavioral.load(tenant_id)
             if profile:
@@ -159,7 +159,11 @@ class MemoryOrchestrator:
                         f"({tenant_id})"
                     )
 
-        # ── Layer 3: Knowledge ────────────────────────────────────────
+        # ── Layer 3: Knowledge (always active if entities exist) ─────────
+        knowledge_ctx = self._knowledge.build_knowledge_injection(tenant_id)
+        if knowledge_ctx:
+            context_parts.append(knowledge_ctx)
+            logger.debug(f"MemoryOrchestrator: knowledge layer context added ({tenant_id})")
 
         return "\n\n".join(context_parts)
 
@@ -189,9 +193,9 @@ class MemoryOrchestrator:
             float: Importance score between 0.0-1.0.
                    Scores 0.7+ are persisted to episodic store.
         """
-        importance = 0.3  # baseline
+        importance = 0.4  # baseline (raised from 0.3 — capture more conversations)
 
-        if len(messages) >= 8:
+        if len(messages) >= 6:  # Lowered from 8
             importance += 0.2
 
         correction_count = sum(
