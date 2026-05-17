@@ -247,4 +247,6 @@ class EpisodicStore:
         if self._openai_api_key:
             kwargs["api_key"] = self._openai_api_key
         response = litellm.embedding(**kwargs)
+        if isinstance(response.data[0], dict):
+            return response.data[0]["embedding"]
         return response.data[0].embedding
