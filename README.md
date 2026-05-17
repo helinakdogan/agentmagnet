@@ -2,8 +2,6 @@
   <img src="assets/logo.png" alt="Magnet" width="700">
 </p>
 
-# Magnet
-
 <p align="center">
   <a href="https://agentmagnet.app/docs"><img src="https://img.shields.io/badge/Docs-agentmagnet.app-FFD700?style=for-the-badge" alt="Documentation"></a>
   <a href="https://github.com/helinakdogan/magnet-gateway/issues">
