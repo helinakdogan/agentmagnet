@@ -52,11 +52,13 @@ class EpisodicStore:
         redis_client: Any | None = None,
         qdrant_url: str | None = None,
         qdrant_api_key: str | None = None,
+        openai_api_key: str | None = None,
     ) -> None:
         self._redis = redis_client
         self._qdrant: Any | None = None
         self._qdrant_available = False
         self._memory: dict[str, list[dict]] = {}
+        self._openai_api_key = openai_api_key
 
         if qdrant_url:
             if not _HAS_QDRANT:
@@ -238,8 +240,11 @@ class EpisodicStore:
         """
         Generates a text-embedding-3-small vector via litellm.
         """
-        response = litellm.embedding(
-            model="openai/text-embedding-3-small",
-            input=text,
-        )
+        kwargs: dict = {
+            "model": "openai/text-embedding-3-small",
+            "input": text,
+        }
+        if self._openai_api_key:
+            kwargs["api_key"] = self._openai_api_key
+        response = litellm.embedding(**kwargs)
         return response.data[0].embedding

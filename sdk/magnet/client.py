@@ -123,6 +123,7 @@ class BehavioralMemory:
             redis_client=redis_client,
             qdrant_url=_qdrant_url,
             qdrant_api_key=_qdrant_api_key,
+            openai_api_key=self._byok_openai_key,
         )
 
         # ── Layer 3: Knowledge ────────────────────────────────────────

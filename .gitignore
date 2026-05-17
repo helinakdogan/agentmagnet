@@ -16,7 +16,9 @@ dashboard/
 sdk/examples/
 .coverage
 htmlcov/
-
+.check
+check.py
+check_db.py
 
 
 
