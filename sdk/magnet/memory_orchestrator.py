@@ -206,9 +206,10 @@ class MemoryOrchestrator:
         preference_count = sum(
             1 for s in signals
             if s.get("type") in ("preference", "formatting_preference",
-                                  "tone_preference", "detail_preference")
+                                  "tone_preference", "detail_preference",
+                                  "preference_like", "preference_dislike", "personality")
         )
         if preference_count > 0:
-            importance += min(preference_count * 0.05, 0.1)
+            importance += min(preference_count * 0.1, 0.2)
 
         return min(importance, 1.0)
