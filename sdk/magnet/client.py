@@ -130,19 +130,18 @@ class BehavioralMemory:
         _neo4j_auth_str = os.environ.get("NEO4J_AUTH")
         _neo4j_auth = None
         if _neo4j_auth_str:
-            # Support both formats:
-            #   user/password  (simple)
-            #   ("user", "password")  (tuple string from env)
-            clean = _neo4j_auth_str.strip().strip('()\'"')
-            # Remove tuple syntax if present: ("7f3e0cec", "password")
-            if '",' in clean or "'," in clean:
-                import re as _re
-                parts = _re.findall(r'["\']([^"\']+)["\']', _neo4j_auth_str)
-                if len(parts) == 2:
-                    _neo4j_auth = (parts[0], parts[1])
-            elif "/" in clean:
-                user, pwd = clean.split("/", 1)
-                _neo4j_auth = (user.strip(), pwd.strip())
+            # Robust parser: regex-first (handles tuple format), slash fallback
+            import re as _re
+            _m = _re.findall(r'["\'](.*?)["\'']', _neo4j_auth_str)
+            if len(_m) >= 2:
+                _neo4j_auth = (_m[0], _m[1])
+            else:
+                _c = _neo4j_auth_str.strip(" ()\"'")
+                if "/" in _c:
+                    _u, _p = _c.split("/", 1)
+                    _neo4j_auth = (_u.strip(), _p.strip())
+                elif _c:
+                    _neo4j_auth = (_c, "")
 
         self._knowledge = KnowledgeStore(
             neo4j_url=_neo4j_url,

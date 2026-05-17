@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 _EPISODIC_KEY_PREFIX = "magnet:episodic:"
 _MAX_EPISODES = 50
-_EPISODE_TTL = 60 * 60 * 24 * 90  # 90 gün
+_EPISODE_TTL = 60 * 60 * 24 * 90  # 90 days
 _QDRANT_COLLECTION = "magnet_episodes"
 _EMBEDDING_DIM = 1536  # text-embedding-3-small
 
@@ -99,9 +99,9 @@ class EpisodicStore:
             summary:    Optional summary. Generated via _auto_summarize if omitted.
             importance: Importance score between 0.0-1.0. Skipped if below 0.7.
         """
-        if importance < 0.7:
+        if importance < 0.4:
             logger.debug(
-                f"EpisodicStore: importance={importance:.2f} < 0.7, skipped ({tenant_id})"
+                f"EpisodicStore: importance={importance:.2f} < 0.4, skipped ({tenant_id})"
             )
             return
 
