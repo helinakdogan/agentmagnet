@@ -132,7 +132,7 @@ class BehavioralMemory:
         if _neo4j_auth_str:
             # Robust parser: regex-first (handles tuple format), slash fallback
             import re as _re
-            _m = _re.findall(r'["\'](.*?)["\'']', _neo4j_auth_str)
+            _m = _re.findall(r'["\'](.*?)["\']', _neo4j_auth_str)
             if len(_m) >= 2:
                 _neo4j_auth = (_m[0], _m[1])
             else:
