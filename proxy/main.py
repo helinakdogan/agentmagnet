@@ -51,6 +51,8 @@ vmm_memory = BehavioralMemory(
     redis_client=r_sync,
     signal_threshold=3,
     enable_aggregate=True,
+    qdrant_url=os.getenv("QDRANT_URL"),
+    qdrant_api_key=os.getenv("QDRANT_API_KEY"),
 )
 
 # Cost-per-token lookup (input token price in USD)
