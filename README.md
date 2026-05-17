@@ -119,9 +119,9 @@ All documentation lives at **[agentmagnet.app/docs](https://agentmagnet.app/docs
 
 We welcome contributions! Please open an issue or submit a pull request. Check out our `CONTRIBUTING.md` for guidelines.
 
-- 💬 **Discord**: [Join our Community](#) *(Coming Soon!)*
-- 🐛 **Issues**: [Report a bug or request a feature](https://github.com/helinakdogan/magnet-gateway/issues)
-- 🐦 **Twitter**: [@AgentMagnetAI](https://twitter.com/AgentMagnetAI)
+- **Discord**: [Join our Community](#) *(Coming Soon!)*
+- **Issues**: [Report a bug or request a feature](https://github.com/helinakdogan/magnet-gateway/issues)
+- **X**: [@AgentMagnetAI](https://twitter.com/AgentMagnetAI)
 
 ---
 
