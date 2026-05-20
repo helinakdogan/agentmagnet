@@ -355,23 +355,23 @@ class KnowledgeStore:
                     result = session.run(
                         """
                         MATCH (u:User {tenant_id: $tenant_id})-[:HAS_ENTITY]->(e:Entity {type: $type})
-                        WHERE $query = '' OR toLower(e.content) CONTAINS toLower($query)
+                        WHERE $search_text = '' OR toLower(e.content) CONTAINS toLower($search_text)
                         RETURN e ORDER BY e.stored_at DESC LIMIT $limit
                         """,
                         tenant_id=tenant_id,
                         type=entity_type,
-                        query=query,
+                        search_text=query,
                         limit=limit,
                     )
                 else:
                     result = session.run(
                         """
                         MATCH (u:User {tenant_id: $tenant_id})-[:HAS_ENTITY]->(e:Entity)
-                        WHERE $query = '' OR toLower(e.content) CONTAINS toLower($query)
+                        WHERE $search_text = '' OR toLower(e.content) CONTAINS toLower($search_text)
                         RETURN e ORDER BY e.stored_at DESC LIMIT $limit
                         """,
                         tenant_id=tenant_id,
-                        query=query,
+                        search_text=query,
                         limit=limit,
                     )
                 return [dict(record["e"]) for record in result]

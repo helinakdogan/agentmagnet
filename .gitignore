@@ -19,6 +19,7 @@ htmlcov/
 .check
 check.py
 check_db.py
+test_sdk_live.py
 
 
 
