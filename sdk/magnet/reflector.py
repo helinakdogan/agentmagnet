@@ -268,21 +268,23 @@ class Reflector:
 
         return "\n".join(lines)
 
-    def _upsert_preference(self, pref_list: list, new_item: str) -> None:
-        if not pref_list:
-            pref_list.append(new_item)
+    def _upsert_preference(self, existing: list, item: str) -> None:
+        if not existing:
+            existing.append(item)
             return
 
+        print(f"[DEDUP] checking '{item}' against {len(existing)} existing items")
         embeddings = None
         for attempt in range(2):
             try:
                 logger.debug(
-                    f"_upsert_preference: embedding {len(pref_list) + 1} texts for dedup "
+                    f"_upsert_preference: embedding {len(existing) + 1} texts for dedup "
                     f"(attempt {attempt + 1})"
                 )
-                embeddings = self._embed_batch(pref_list + [new_item])
+                embeddings = self._embed_batch(existing + [item])
                 break
             except Exception as e:
+                print(f"[DEDUP] embedding failed: {e}")
                 logger.error(
                     f"_upsert_preference: _embed_batch failed on attempt {attempt + 1} — "
                     f"{type(e).__name__}: {e}",
@@ -294,10 +296,10 @@ class Reflector:
         if embeddings is None:
             logger.warning(
                 f"_upsert_preference: embedding failed after retries, "
-                f"falling back to exact match for {new_item!r}"
+                f"falling back to exact match for {item!r}"
             )
-            if new_item not in pref_list:
-                pref_list.append(new_item)
+            if item not in existing:
+                existing.append(item)
             return
 
         new_emb = embeddings[-1]
@@ -309,14 +311,14 @@ class Reflector:
         if best_sim > 0.80:
             logger.debug(
                 f"_upsert_preference: dedup hit (sim={best_sim:.3f}), "
-                f"replacing {pref_list[best_idx]!r} with {new_item!r}"
+                f"replacing {existing[best_idx]!r} with {item!r}"
             )
-            pref_list[best_idx] = new_item
+            existing[best_idx] = item
         else:
             logger.debug(
-                f"_upsert_preference: no dedup match (best_sim={best_sim:.3f}), appending {new_item!r}"
+                f"_upsert_preference: no dedup match (best_sim={best_sim:.3f}), appending {item!r}"
             )
-            pref_list.append(new_item)
+            existing.append(item)
 
     def _embed_batch(self, texts: list) -> list:
         kwargs: dict = {
