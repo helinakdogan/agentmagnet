@@ -180,20 +180,14 @@ class Reflector:
             return profile
 
         if signal_type == "preference_dislike":
-            dislikes = profile.setdefault("dislikes", [])
-            if extracted_preference not in dislikes:
-                dislikes.append(extracted_preference)
-                logger.info(f"instant_learn: dislike added for {user_id}: {extracted_preference!r}")
+            self._upsert_preference(profile.setdefault("dislikes", []), extracted_preference)
+            logger.info(f"instant_learn: dislike upserted for {user_id}: {extracted_preference!r}")
         elif signal_type == "preference_like":
-            likes = profile.setdefault("likes", [])
-            if extracted_preference not in likes:
-                likes.append(extracted_preference)
-                logger.info(f"instant_learn: like added for {user_id}: {extracted_preference!r}")
+            self._upsert_preference(profile.setdefault("likes", []), extracted_preference)
+            logger.info(f"instant_learn: like upserted for {user_id}: {extracted_preference!r}")
         elif signal_type in ("tone_preference", "formatting_preference", "detail_preference"):
-            expectations = profile.setdefault("personality_expectations", [])
-            if extracted_preference not in expectations:
-                expectations.append(extracted_preference)
-                logger.info(f"instant_learn: personality expectation added for {user_id}: {extracted_preference!r}")
+            self._upsert_preference(profile.setdefault("personality_expectations", []), extracted_preference)
+            logger.info(f"instant_learn: personality expectation upserted for {user_id}: {extracted_preference!r}")
 
         profile["reflected_at"] = time.time()
         return profile
@@ -234,6 +228,13 @@ class Reflector:
             lines.append("\nLearned preferences:")
             for k, v in all_prefs.items():
                 conf = confidence_scores.get(k, v.get("confidence", 0))
+                valid_from = v.get("valid_from")
+                decay_rate = v.get("decay_rate", 0.02)
+                if valid_from:
+                    days_elapsed = (time.time() - valid_from) / 86400
+                    conf *= (1 - decay_rate) ** days_elapsed
+                if conf < 0.1:
+                    continue
                 pct = int(conf * 100)
                 lines.append(f"  - {k}: {v['value']} (confidence: {pct}%)")
 
@@ -266,6 +267,47 @@ class Reflector:
         lines.append("Respect them strictly. Allow user to override at any time.")
 
         return "\n".join(lines)
+
+    def _upsert_preference(self, pref_list: list, new_item: str) -> None:
+        if not pref_list:
+            pref_list.append(new_item)
+            return
+        try:
+            embeddings = self._embed_batch(pref_list + [new_item])
+            new_emb = embeddings[-1]
+            best_idx, best_sim = -1, 0.0
+            for i, emb in enumerate(embeddings[:-1]):
+                sim = self._cosine_sim(new_emb, emb)
+                if sim > best_sim:
+                    best_sim, best_idx = sim, i
+            if best_sim > 0.85:
+                pref_list[best_idx] = new_item
+            else:
+                pref_list.append(new_item)
+        except Exception as e:
+            logger.warning(f"Semantic dedup failed, falling back to exact match: {e}")
+            if new_item not in pref_list:
+                pref_list.append(new_item)
+
+    def _embed_batch(self, texts: list) -> list:
+        kwargs: dict = {
+            "model": "openai/text-embedding-3-small",
+            "input": texts,
+        }
+        if self._openai_api_key:
+            kwargs["api_key"] = self._openai_api_key
+        response = litellm.embedding(**kwargs)
+        return [
+            d["embedding"] if isinstance(d, dict) else d.embedding
+            for d in response.data
+        ]
+
+    @staticmethod
+    def _cosine_sim(a: list, b: list) -> float:
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(x * x for x in b) ** 0.5
+        return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
 
     def _call_llm(self, prompt: str) -> str:
         api_key = (
@@ -301,13 +343,13 @@ class Reflector:
         """
         confidence_scores = current.setdefault("confidence_scores", {})
 
-        # Merge lists additively (no duplicates)
+        # Merge lists with semantic dedup
         for list_key in ("likes", "dislikes", "personality_expectations"):
             existing_list = current.setdefault(list_key, [])
             new_items = updates.get(list_key, [])
             for item in new_items:
-                if isinstance(item, str) and item and item not in existing_list:
-                    existing_list.append(item)
+                if isinstance(item, str) and item:
+                    self._upsert_preference(existing_list, item)
 
         # Merge structured preferences
         for scope in ["global_preferences", "contextual_profiles"]:
