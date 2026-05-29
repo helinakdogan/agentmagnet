@@ -20,6 +20,8 @@ htmlcov/
 check.py
 check_db.py
 test_sdk_live.py
-
+reset_dbs.py
+simulate_conversation.py
+inspect_memory.py
 
 

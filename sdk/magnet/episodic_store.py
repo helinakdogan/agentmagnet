@@ -99,7 +99,7 @@ class EpisodicStore:
             tenant_id:  Tenant ID in ``project_id:user_id`` format.
             messages:   List of conversation messages.
             summary:    Optional summary. Generated via _auto_summarize if omitted.
-            importance: Importance score between 0.0-1.0. Skipped if below 0.7.
+            importance: Importance score between 0.0-1.0. Skipped if below 0.4.
         """
         if importance < 0.4:
             logger.debug(

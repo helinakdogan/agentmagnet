@@ -157,6 +157,8 @@ class BehavioralMemory:
         }
         # Soft signals still buffer until threshold
         self._soft_signal_threshold = signal_threshold
+        # Minimum classifier confidence to accept a signal; below this is noise
+        self._min_signal_confidence = 0.30
 
         # ── Memory Orchestrator ───────────────────────────────────────
         self._orchestrator = MemoryOrchestrator(
@@ -200,7 +202,7 @@ class BehavioralMemory:
                     last_msg = user_msgs[-1].get("content", "")
                     context_msgs = messages[:-1] if len(messages) > 1 else []
                     cls_res = self.classifier.classify(context_msgs, last_msg)
-                    if cls_res.signal_type not in ("neutral",):
+                    if cls_res.signal_type not in ("neutral",) and cls_res.confidence >= self._min_signal_confidence:
                         signal_entry = {
                             "type": cls_res.signal_type,
                             "message": last_msg[:200],
@@ -304,7 +306,7 @@ class BehavioralMemory:
                     "cost_tier": routing_decision.cost_tier,
                 }
         except Exception as e:
-            logger.error(f"Behavioral add error: {e}")
+            logger.error(f"Behavioral add error: {e}", exc_info=True)
 
         return result
 
@@ -333,7 +335,7 @@ class BehavioralMemory:
                     cls_res = await asyncio.to_thread(
                         self.classifier.classify, context_msgs, last_msg
                     )
-                    if cls_res.signal_type not in ("neutral",):
+                    if cls_res.signal_type not in ("neutral",) and cls_res.confidence >= self._min_signal_confidence:
                         signal_entry = {
                             "type": cls_res.signal_type,
                             "message": last_msg[:200],
@@ -430,7 +432,7 @@ class BehavioralMemory:
                     "cost_tier": routing_decision.cost_tier,
                 }
         except Exception as e:
-            logger.error(f"Behavioral async_add error: {e}")
+            logger.error(f"Behavioral async_add error: {e}", exc_info=True)
 
         return result
 
@@ -545,7 +547,7 @@ class BehavioralMemory:
         signals = self._buffer.flush(tenant_id)
         if not signals:
             return {}
-        existing_profile = self.get_profile(project_id, user_id)
+        existing_profile = self.get_profile(user_id, project_id)
         profile = self._reflector.reflect(tenant_id, signals, existing_profile)
         self._store.save(tenant_id, profile)
         self._profile_cache.pop(tenant_id, None)
@@ -582,14 +584,35 @@ class BehavioralMemory:
     async def _do_reflect(self, tenant_id: str, signals: list[dict]) -> None:
         try:
             existing_profile = await asyncio.to_thread(self._store.load, tenant_id)
+            old_likes = set((existing_profile or {}).get("likes", []))
+            old_dislikes = set((existing_profile or {}).get("dislikes", []))
+
             profile = await asyncio.to_thread(
                 self._reflector.reflect, tenant_id, signals, existing_profile
             )
             await asyncio.to_thread(self._store.save, tenant_id, profile)
             self._profile_cache.pop(tenant_id, None)
+
+            # Sync newly learned likes/dislikes to the knowledge layer
+            for item in profile.get("likes", []):
+                if item not in old_likes:
+                    self._knowledge.store_entity(tenant_id, {
+                        "type": "like", "content": item,
+                        "dimension": "general", "confidence": 0.6,
+                    })
+            for item in profile.get("dislikes", []):
+                if item not in old_dislikes:
+                    self._knowledge.store_entity(tenant_id, {
+                        "type": "dislike", "content": item,
+                        "dimension": "general", "confidence": 0.6,
+                    })
+
             logger.info(f"Reflect completed: {tenant_id}")
         except Exception as e:
-            logger.error(f"Reflect error ({tenant_id}): {e}")
+            logger.error(
+                f"Reflect error ({tenant_id}): {e}. {len(signals)} signals may be lost.",
+                exc_info=True,
+            )
 
     def _classify_category_local(self, text: str) -> str:
         """
