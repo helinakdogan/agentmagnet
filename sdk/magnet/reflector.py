@@ -273,6 +273,7 @@ class Reflector:
             pref_list.append(new_item)
             return
         try:
+            logger.debug(f"_upsert_preference: embedding {len(pref_list) + 1} texts for dedup")
             embeddings = self._embed_batch(pref_list + [new_item])
             new_emb = embeddings[-1]
             best_idx, best_sim = -1, 0.0
@@ -281,11 +282,21 @@ class Reflector:
                 if sim > best_sim:
                     best_sim, best_idx = sim, i
             if best_sim > 0.85:
+                logger.debug(
+                    f"_upsert_preference: dedup hit (sim={best_sim:.3f}), "
+                    f"replacing {pref_list[best_idx]!r} with {new_item!r}"
+                )
                 pref_list[best_idx] = new_item
             else:
+                logger.debug(
+                    f"_upsert_preference: no dedup match (best_sim={best_sim:.3f}), appending {new_item!r}"
+                )
                 pref_list.append(new_item)
         except Exception as e:
-            logger.warning(f"Semantic dedup failed, falling back to exact match: {e}")
+            logger.warning(
+                f"_upsert_preference: embedding call failed, falling back to exact match: {e}",
+                exc_info=True,
+            )
             if new_item not in pref_list:
                 pref_list.append(new_item)
 

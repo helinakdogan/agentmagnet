@@ -18,7 +18,7 @@ import litellm  # type: ignore
 
 try:
     from qdrant_client import QdrantClient  # type: ignore
-    from qdrant_client.models import Distance, VectorParams, PointStruct  # type: ignore
+    from qdrant_client.models import Distance, VectorParams, PointStruct, PayloadSchemaType  # type: ignore
     _HAS_QDRANT = True
 except ImportError:
     _HAS_QDRANT = False
@@ -75,6 +75,11 @@ class EpisodicStore:
                                 size=_EMBEDDING_DIM,
                                 distance=Distance.COSINE,
                             ),
+                        )
+                        self._qdrant.create_payload_index(
+                            collection_name=_QDRANT_COLLECTION,
+                            field_name="tenant_id",
+                            field_schema=PayloadSchemaType.KEYWORD,
                         )
                     self._qdrant_available = True
                     logger.info("EpisodicStore: Qdrant connected.")

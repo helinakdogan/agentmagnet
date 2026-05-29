@@ -236,21 +236,42 @@ class KnowledgeStore:
     def _redis_key(self, tenant_id: str, entity_type: str) -> str:
         return f"{_ENTITY_PREFIX}{tenant_id}:{entity_type}"
 
+    # Sentiment pairs: inserting a "like" should evict the matching "dislike" and vice versa.
+    _OPPOSITE_TYPE = {"like": "dislike", "dislike": "like"}
+
     def _store_redis(self, tenant_id: str, entity_type: str, entity: dict) -> None:
         key = self._redis_key(tenant_id, entity_type)
+        content = entity.get("content", "")
+        if not content:
+            return
         try:
-            # Avoid exact duplicates
+            # Remove semantically conflicting entry from the opposite-sentiment list first.
+            opposite_type = self._OPPOSITE_TYPE.get(entity_type)
+            if opposite_type:
+                opp_key = self._redis_key(tenant_id, opposite_type)
+                opp_raw_list = self._redis.lrange(opp_key, 0, -1)
+                for raw in opp_raw_list:
+                    try:
+                        parsed = json.loads(raw)
+                        if parsed.get("content", "").lower() == content.lower():
+                            self._redis.lrem(opp_key, 0, raw)
+                            logger.info(
+                                f"KnowledgeStore: removed conflicting {opposite_type!r} entry "
+                                f"{content!r} before inserting {entity_type!r}"
+                            )
+                    except Exception:
+                        pass
+
+            # Avoid exact duplicates within the same sentiment list.
             existing_raw = self._redis.lrange(key, 0, -1)
             existing_contents = set()
             for raw in existing_raw:
                 try:
-                    parsed = json.loads(raw)
-                    existing_contents.add(parsed.get("content", ""))
+                    existing_contents.add(json.loads(raw).get("content", ""))
                 except Exception:
                     pass
 
-            content = entity.get("content", "")
-            if content and content not in existing_contents:
+            if content not in existing_contents:
                 self._redis.rpush(key, json.dumps(entity, ensure_ascii=False))
                 self._redis.expire(key, _ENTITY_TTL)
         except Exception as e:
