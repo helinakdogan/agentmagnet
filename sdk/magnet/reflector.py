@@ -273,63 +273,46 @@ class Reflector:
             existing.append(item)
             return
 
-        print(f"[DEDUP] checking '{item}' against {len(existing)} existing items")
+        # Try embedding (2 attempts)
         embeddings = None
         for attempt in range(2):
             try:
-                logger.debug(
-                    f"_upsert_preference: embedding {len(existing) + 1} texts for dedup "
-                    f"(attempt {attempt + 1})"
-                )
                 embeddings = self._embed_batch(existing + [item])
                 break
             except Exception as e:
                 print(f"[DEDUP] embedding failed: {type(e).__name__}: {e}")
-                # Only emit full traceback on the final failure
                 logger.warning(
                     f"_upsert_preference: _embed_batch attempt {attempt + 1} failed — "
                     f"{type(e).__name__}: {e}",
                     exc_info=(attempt == 1),
                 )
 
-        if embeddings is not None:
-            new_emb = embeddings[-1]
-            best_idx, best_sim = -1, 0.0
-            for i, emb in enumerate(embeddings[:-1]):
-                sim = self._cosine_sim(new_emb, emb)
-                if sim > best_sim:
-                    best_sim, best_idx = sim, i
-            if best_sim > 0.80:
-                logger.debug(
-                    f"_upsert_preference: dedup hit (sim={best_sim:.3f}), "
-                    f"replacing {existing[best_idx]!r} with {item!r}"
-                )
-                existing[best_idx] = item
-            else:
-                logger.debug(
-                    f"_upsert_preference: no dedup match (best_sim={best_sim:.3f}), appending {item!r}"
-                )
-                existing.append(item)
-            return
-
-        # Embedding unavailable — fall back to stopword-normalized fuzzy match
-        logger.warning(
-            f"_upsert_preference: embedding unavailable, using fuzzy fallback for {item!r}"
-        )
-        best_idx, best_ratio = -1, 0.0
+        # Always compute difflib scores
         item_norm = self._normalize(item)
+        new_emb = embeddings[-1] if embeddings is not None else None
+
+        best_idx, best_score = -1, 0.0
         for i, existing_item in enumerate(existing):
-            ratio = self._fuzzy_sim(item_norm, self._normalize(existing_item))
-            if ratio > best_ratio:
-                best_ratio, best_idx = ratio, i
-        print(f"[DEDUP] fuzzy fallback best ratio={best_ratio:.3f} for {item!r}")
-        if best_ratio > 0.70:
-            logger.info(
-                f"_upsert_preference: fuzzy dedup hit (ratio={best_ratio:.3f}), "
+            emb_score = (
+                self._cosine_sim(new_emb, embeddings[i])
+                if new_emb is not None else 0.0
+            )
+            difflib_score = self._fuzzy_sim(item_norm, self._normalize(existing_item))
+            combined = max(emb_score, difflib_score)
+            print(f"[DEDUP] '{item}' vs '{existing_item}' → emb={emb_score:.3f} difflib={difflib_score:.3f} max={combined:.3f}")
+            if combined > best_score:
+                best_score, best_idx = combined, i
+
+        if best_score > 0.78:
+            logger.debug(
+                f"_upsert_preference: dedup hit (score={best_score:.3f}), "
                 f"replacing {existing[best_idx]!r} with {item!r}"
             )
             existing[best_idx] = item
         else:
+            logger.debug(
+                f"_upsert_preference: no dedup match (best={best_score:.3f}), appending {item!r}"
+            )
             existing.append(item)
 
     def _embed_batch(self, texts: list) -> list:
