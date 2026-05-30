@@ -18,7 +18,10 @@ import litellm  # type: ignore
 
 try:
     from qdrant_client import QdrantClient  # type: ignore
-    from qdrant_client.models import Distance, VectorParams, PointStruct, PayloadSchemaType  # type: ignore
+    from qdrant_client.models import (  # type: ignore
+        Distance, VectorParams, PointStruct, PayloadSchemaType,
+        Filter, FieldCondition, MatchValue,
+    )
     _HAS_QDRANT = True
 except ImportError:
     _HAS_QDRANT = False
@@ -197,15 +200,15 @@ class EpisodicStore:
         """Performs a semantic search in Qdrant."""
         try:
             embedding = self._embed(query)
-            results = self._qdrant.search(
+            response = self._qdrant.query_points(
                 collection_name=_QDRANT_COLLECTION,
-                query_vector=embedding,
-                query_filter={
-                    "must": [{"key": "tenant_id", "match": {"value": tenant_id}}]
-                },
+                query=embedding,
+                query_filter=Filter(
+                    must=[FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id))]
+                ),
                 limit=top_k,
             )
-            return [hit.payload for hit in results]
+            return [hit.payload for hit in response.points]
         except Exception as e:
             logger.error(f"EpisodicStore: Qdrant search error: {e}")
             if self._redis:

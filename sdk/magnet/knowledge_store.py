@@ -42,7 +42,6 @@ _TYPE_TO_REL = {
 }
 
 _REL_TO_TYPE: dict[str, str] = {v: k for k, v in _TYPE_TO_REL.items()}
-_REL_TO_TYPE["DISLIKED_BY"] = "dislike"
 
 
 class KnowledgeStore:
@@ -272,8 +271,6 @@ class KnowledgeStore:
             rel = _TYPE_TO_REL.get(entity_type)
             if rel:
                 target_rels = {rel}
-                if entity_type == "dislike":
-                    target_rels.add("DISLIKED_BY")
 
         results = []
         for key, lst in self._memory.items():
@@ -329,10 +326,7 @@ class KnowledgeStore:
         try:
             with self._neo4j_driver.session() as session:
                 if entity_type and entity_type in _TYPE_TO_REL:
-                    rels = [_TYPE_TO_REL[entity_type]]
-                    if entity_type == "dislike":
-                        rels.append("DISLIKED_BY")
-                    rel_filter = "|".join(rels)
+                    rel_filter = _TYPE_TO_REL[entity_type]
                     result = session.run(
                         f"""
                         MATCH (s:Subject {{tenant_id: $tenant_id}})-[r:{rel_filter}]->(u:User {{tenant_id: $tenant_id}})
