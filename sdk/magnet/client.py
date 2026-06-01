@@ -584,28 +584,36 @@ class BehavioralMemory:
     async def _do_reflect(self, tenant_id: str, signals: list[dict]) -> None:
         try:
             existing_profile = await asyncio.to_thread(self._store.load, tenant_id)
-            old_likes = set((existing_profile or {}).get("likes", []))
-            old_dislikes = set((existing_profile or {}).get("dislikes", []))
+            old_pref_keys = {
+                (p.get("subject", ""), p.get("relation", ""))
+                for p in (existing_profile or {}).get("preferences", [])
+                if isinstance(p, dict)
+            }
 
-            profile = await asyncio.to_thread(
+            reflected_profile = await asyncio.to_thread(
                 self._reflector.reflect, tenant_id, signals, existing_profile
             )
-            await asyncio.to_thread(self._store.save, tenant_id, profile)
+            await asyncio.to_thread(self._store.save, tenant_id, reflected_profile)
             self._profile_cache.pop(tenant_id, None)
 
-            # Sync newly learned likes/dislikes to the knowledge layer
-            for item in profile.get("likes", []):
-                if item not in old_likes:
-                    self._knowledge.store_entity(tenant_id, {
-                        "type": "like", "content": item,
-                        "dimension": "general", "confidence": 0.6,
-                    })
-            for item in profile.get("dislikes", []):
-                if item not in old_dislikes:
-                    self._knowledge.store_entity(tenant_id, {
-                        "type": "dislike", "content": item,
-                        "dimension": "general", "confidence": 0.6,
-                    })
+            # Sync newly learned preferences to the knowledge layer
+            for pref in reflected_profile.get("preferences", []):
+                if not isinstance(pref, dict):
+                    continue
+                if (pref.get("subject", ""), pref.get("relation", "")) in old_pref_keys:
+                    continue
+                relation = pref.get("relation", "")
+                entity_type = (
+                    "dislike" if relation == "dislikes"
+                    else "like" if relation == "prefers"
+                    else "personality"
+                )
+                self._knowledge.store_entity(tenant_id, {
+                    "type": entity_type,
+                    "content": pref.get("natural_text", pref.get("subject", "")),
+                    "dimension": pref.get("subject_type", "general"),
+                    "confidence": pref.get("confidence", 0.6),
+                })
 
             logger.info(f"Reflect completed: {tenant_id}")
         except Exception as e:
