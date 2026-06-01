@@ -58,6 +58,49 @@ Signals:
 Extract or update preference facts from these signals.
 Return only NEW or CHANGED preferences as a JSON array."""
 
+_FALLBACK_SYSTEM_PROMPT = """You are a behavioral analyst AI.
+You will analyze behavioral signals from a user's interaction with an AI agent.
+Your goal is to extract a structured user preference profile from these signals.
+
+OUTPUT FORMAT (only JSON, write nothing else):
+{
+  "global_preferences": {
+    "language": {"value": "turkish", "confidence": 0.95},
+    "formatting": {"value": "markdown", "confidence": 0.80}
+  },
+  "contextual_profiles": {},
+  "likes": [
+    "Markdown-formatted responses",
+    "Short and concise explanations"
+  ],
+  "dislikes": [
+    "Long, repetitive explanations",
+    "Formal language"
+  ],
+  "personality_expectations": [
+    "Friendly and witty tone",
+    "Direct answers without unnecessary preamble"
+  ]
+}
+
+RULES:
+- likes: Free-text list of things the user explicitly likes or approves of. Be specific.
+- dislikes: Free-text list of things the user dislikes, wants to avoid, or complained about.
+- personality_expectations: How the user wants the AI to behave or communicate.
+- Confidence: 1 signal=0.40, 2 signals=0.60, 3 signals=0.75, 5+ signals=0.90+
+- Never hallucinate. Only extract what's actually in the signals.
+- Always output valid JSON with no extra text.
+- If a signal has `extracted_preference` field, use it verbatim in the appropriate list.
+"""
+
+_FALLBACK_USER_TEMPLATE = """User ID: {user_id}
+Signal count: {signal_count}
+
+Signals:
+{signals_json}
+
+Extract the behavioral profile from these signals."""
+
 
 class Reflector:
     """
@@ -87,35 +130,109 @@ class Reflector:
             logger.warning("Reflector: anthropic_client parameter is deprecated, ignoring.")
 
     def reflect(self, user_id: str, signals: list[dict], existing_profile: dict | None = None) -> dict:
-        """Performs the reflection process to update a user profile."""
+        """
+        Performs the reflection process to update a user profile.
+
+        Pass 1: request new structured JSON array format. If the model returns
+        a non-empty list with valid subject keys, use it directly.
+        Pass 2: if Pass 1 yields nothing (model returned old dict format,
+        empty array, or failed), re-call with the legacy prompt and convert
+        the result to the new preference object schema.
+        """
         if not signals:
             return existing_profile or self._empty_profile()
 
         current_state = self._migrate_profile(existing_profile) if existing_profile else self._empty_profile()
         existing_preferences = current_state.get("preferences", [])
 
+        try:
+            new_prefs = self._reflect_pass1(user_id, signals, existing_preferences)
+
+            if not new_prefs:
+                logger.info(f"Reflector: Pass 1 empty for {user_id}, falling back to legacy format")
+                new_prefs = self._reflect_pass2(user_id, signals)
+
+            is_correction = any(s.get("type") in ("correction", "rejection") for s in signals)
+            profile = self._merge_state(current_state, new_prefs, is_correction)
+            profile["reflected_at"] = time.time()
+            profile["signal_count"] = len(signals)
+            logger.info(f"Reflector: profile updated for {user_id} — {len(signals)} signals, {len(new_prefs)} new prefs")
+            return profile
+        except Exception as e:
+            logger.error(f"Reflector error ({user_id}): {e}")
+            return current_state
+
+    def _reflect_pass1(self, user_id: str, signals: list[dict], existing_preferences: list) -> list:
+        """Request new structured JSON array; return validated preference objects."""
         prompt = _USER_TEMPLATE.format(
             user_id=user_id,
             existing_preferences=json.dumps(existing_preferences, ensure_ascii=False),
             signal_count=len(signals),
             signals_json=json.dumps(signals, ensure_ascii=False, indent=2),
         )
-
         try:
             raw = self._call_llm(prompt)
             parsed = self._parse(raw)
-            new_prefs = parsed if isinstance(parsed, list) else parsed.get("preferences", [])
-
-            is_correction = any(s.get("type") in ("correction", "rejection") for s in signals)
-            profile = self._merge_state(current_state, new_prefs, is_correction)
-
-            profile["reflected_at"] = time.time()
-            profile["signal_count"] = len(signals)
-            logger.info(f"Reflector: profile updated for {user_id} — {len(signals)} signals")
-            return profile
+            if isinstance(parsed, list):
+                valid = [p for p in parsed if isinstance(p, dict) and "subject" in p]
+                return valid
+            # Model wrapped the array in a dict
+            if isinstance(parsed, dict):
+                wrapped = parsed.get("preferences", [])
+                if isinstance(wrapped, list):
+                    valid = [p for p in wrapped if isinstance(p, dict) and "subject" in p]
+                    return valid
         except Exception as e:
-            logger.error(f"Reflector error ({user_id}): {e}")
-            return current_state
+            logger.warning(f"Reflector Pass 1 failed for {user_id}: {type(e).__name__}: {e}")
+        return []
+
+    def _reflect_pass2(self, user_id: str, signals: list[dict]) -> list:
+        """Fallback: use legacy prompt, then convert old dict to new preference objects."""
+        prompt = _FALLBACK_USER_TEMPLATE.format(
+            user_id=user_id,
+            signal_count=len(signals),
+            signals_json=json.dumps(signals, ensure_ascii=False, indent=2),
+        )
+        try:
+            raw = self._call_llm(prompt, system_prompt=_FALLBACK_SYSTEM_PROMPT)
+            parsed = self._parse(raw)
+            if isinstance(parsed, dict):
+                return self._convert_old_format(parsed)
+            # Model returned a list even with fallback prompt — normalize and use it
+            if isinstance(parsed, list):
+                valid = [p for p in parsed if isinstance(p, dict) and "subject" in p]
+                return valid
+        except Exception as e:
+            logger.warning(f"Reflector Pass 2 failed for {user_id}: {type(e).__name__}: {e}")
+        return []
+
+    @staticmethod
+    def _convert_old_format(old_dict: dict) -> list:
+        """Convert a legacy likes/dislikes/personality dict to new preference objects."""
+        now = time.time()
+        result = []
+        for item in old_dict.get("likes", []):
+            if isinstance(item, str) and item:
+                result.append({
+                    "subject": item, "subject_type": "general", "relation": "prefers",
+                    "value": item, "natural_text": item, "preference_type": "contextual",
+                    "confidence": 0.7, "valid_from": now, "decay_rate": 0.02, "recall_count": 0,
+                })
+        for item in old_dict.get("dislikes", []):
+            if isinstance(item, str) and item:
+                result.append({
+                    "subject": item, "subject_type": "general", "relation": "dislikes",
+                    "value": item, "natural_text": item, "preference_type": "contextual",
+                    "confidence": 0.7, "valid_from": now, "decay_rate": 0.02, "recall_count": 0,
+                })
+        for item in old_dict.get("personality_expectations", []):
+            if isinstance(item, str) and item:
+                result.append({
+                    "subject": item, "subject_type": "tone", "relation": "expects",
+                    "value": item, "natural_text": item, "preference_type": "contextual",
+                    "confidence": 0.7, "valid_from": now, "decay_rate": 0.02, "recall_count": 0,
+                })
+        return result
 
     def instant_learn(
         self,
@@ -292,7 +409,7 @@ class Reflector:
 
         existing.append(item)
 
-    def _call_llm(self, prompt: str) -> str:
+    def _call_llm(self, prompt: str, system_prompt: str = _SYSTEM_PROMPT) -> str:
         api_key = (
             self._openai_api_key if "openai" in self.model
             else self._anthropic_api_key
@@ -301,7 +418,7 @@ class Reflector:
         response = litellm.completion(
             model=self.model,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
@@ -316,7 +433,20 @@ class Reflector:
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        return json.loads(raw.strip())
+        parsed = json.loads(raw.strip())
+        if isinstance(parsed, list):
+            return [self._normalize_pref_keys(p) if isinstance(p, dict) else p for p in parsed]
+        return parsed
+
+    @staticmethod
+    def _normalize_pref_keys(pref: dict) -> dict:
+        """Accept alternative field names the LLM may use."""
+        normalized = dict(pref)
+        if "subject" not in normalized and "entity" in normalized:
+            normalized["subject"] = normalized.pop("entity")
+        if "relation" not in normalized and "type" in normalized:
+            normalized["relation"] = normalized.pop("type")
+        return normalized
 
     def _merge_state(self, current: dict, new_prefs: list, is_correction: bool = False) -> dict:
         existing_list = current.setdefault("preferences", [])
