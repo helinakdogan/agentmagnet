@@ -60,3 +60,41 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(se
         "project_id": canonical_project_id,
         "openai_api_key": None,  # Reserved for future BYOK: add openai_api_key column to api_keys table
     }
+
+
+def check_and_increment_daily_limit(project_id: str) -> tuple[bool, int]:
+    """
+    Returns (allowed, current_count).
+    Resets counter if last_reset_date is not today.
+    Returns False if daily_message_count >= 30.
+    """
+    from datetime import date
+    today = date.today().isoformat()
+
+    client = get_supabase_client()
+
+    result = client.table("projects").select(
+        "daily_message_count, last_reset_date"
+    ).eq("id", project_id).single().execute()
+
+    if not result.data:
+        return True, 0
+
+    count = result.data.get("daily_message_count", 0)
+    last_reset = result.data.get("last_reset_date", "")
+
+    if last_reset != today:
+        client.table("projects").update({
+            "daily_message_count": 0,
+            "last_reset_date": today
+        }).eq("id", project_id).execute()
+        count = 0
+
+    if count >= 30:
+        return False, count
+
+    client.table("projects").update({
+        "daily_message_count": count + 1
+    }).eq("id", project_id).execute()
+
+    return True, count + 1

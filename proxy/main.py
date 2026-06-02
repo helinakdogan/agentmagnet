@@ -11,7 +11,7 @@ import json
 from fastapi import FastAPI, Request, Header, HTTPException, BackgroundTasks, Body, Depends
 from dotenv import load_dotenv
 
-from proxy.auth import verify_api_key
+from proxy.auth import verify_api_key, check_and_increment_daily_limit
 from fastapi.middleware.cors import CORSMiddleware
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sdk"))
 from magnet import BehavioralMemory
@@ -195,6 +195,18 @@ async def chat_completions(
 ):
     if not _check_rate_limit(auth_data["api_key_id"]):
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Max 100 requests per minute.")
+
+    allowed, current_count = check_and_increment_daily_limit(auth_data["project_id"])
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "daily_limit_reached",
+                "message": "Daily limit of 30 requests reached. Upgrade to Pro for unlimited access.",
+                "current_count": current_count,
+                "limit": 30
+            }
+        )
 
     # Scope the session ID to its project so cross-project collisions are impossible
     # and a caller cannot target another user's profile by guessing a session ID.
