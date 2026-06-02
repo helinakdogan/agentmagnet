@@ -167,6 +167,19 @@ async def log_telemetry(
         logger.error(f"Telemetry logging failed: {e}")
 
 
+_rate_limit_store: dict[tuple[str, int], int] = {}
+
+
+def _check_rate_limit(api_key_id: str, max_requests: int = 100) -> bool:
+    minute = int(time.time() // 60)
+    key = (api_key_id, minute)
+    _rate_limit_store[key] = _rate_limit_store.get(key, 0) + 1
+    stale = [k for k in list(_rate_limit_store) if k[1] < minute - 1]
+    for k in stale:
+        del _rate_limit_store[k]
+    return _rate_limit_store[key] <= max_requests
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     background_tasks: BackgroundTasks,
@@ -180,13 +193,22 @@ async def chat_completions(
     x_session_id: str = Header("default_session"),
     auth_data: dict = Depends(verify_api_key)
 ):
+    if not _check_rate_limit(auth_data["api_key_id"]):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Max 100 requests per minute.")
+
+    # Scope the session ID to its project so cross-project collisions are impossible
+    # and a caller cannot target another user's profile by guessing a session ID.
+    tenant_user_id = hashlib.sha256(
+        f"{auth_data['project_id']}:{x_session_id}".encode()
+    ).hexdigest()[:32]
+
     messages = body.get("messages", [])
 
     ab_group = get_ab_group(x_session_id)
 
     # A/B Test: Inject behavioral profile only for users in the 'test' group.
     if ab_group == "test":
-        injection = vmm_memory.get_injection(user_id=x_session_id, project_id=auth_data["project_id"], current_messages=messages)
+        injection = vmm_memory.get_injection(user_id=tenant_user_id, project_id=auth_data["project_id"], current_messages=messages)
         if injection:
             system_msg = next((m for m in messages if m.get("role") == "system"), None)
             if system_msg:
@@ -197,7 +219,7 @@ async def chat_completions(
 
     # Determine routing decision (may return None if no router configured)
     recommended = vmm_memory.get_recommended_model(
-        user_id=x_session_id,
+        user_id=tenant_user_id,
         messages=messages,
         project_id=auth_data["project_id"],
     )
@@ -232,7 +254,7 @@ async def chat_completions(
             vmm_memory,
             messages_to_save,
             auth_data["project_id"],
-            x_session_id,
+            tenant_user_id,
             metadata
         )
 
@@ -248,7 +270,7 @@ async def chat_completions(
             log_telemetry,
             r_sync,
             auth_data["project_id"],
-            x_session_id,
+            tenant_user_id,
             ab_group,
             latency_ms,
             p_tokens,

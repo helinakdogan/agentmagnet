@@ -147,12 +147,12 @@ class Reflector:
 
         try:
             pass1_result = self._reflect_pass1(user_id, signals, existing_preferences)
-            print(f"[PASS1] result: {pass1_result[:2] if pass1_result else 'EMPTY'}")
+            logger.debug(f"[PASS1] result: {pass1_result[:2] if pass1_result else 'EMPTY'}")
 
             if not pass1_result:
                 logger.info(f"Reflector: Pass 1 empty for {user_id}, falling back to legacy format")
                 pass2_result = self._reflect_pass2(user_id, signals)
-                print(f"[PASS2] result: {pass2_result[:2] if pass2_result else 'EMPTY'}")
+                logger.debug(f"[PASS2] result: {pass2_result[:2] if pass2_result else 'EMPTY'}")
                 new_prefs = pass2_result
             else:
                 new_prefs = pass1_result
@@ -455,7 +455,7 @@ class Reflector:
 
     def _merge_state(self, current: dict, new_prefs: list, is_correction: bool = False) -> dict:
         existing_list = current.setdefault("preferences", [])
-        print(f"[MERGE] received {len(new_prefs)} preferences")
+        logger.debug(f"[MERGE] received {len(new_prefs)} preferences")
         for pref in new_prefs:
             if not isinstance(pref, dict) or "subject" not in pref:
                 continue
@@ -466,7 +466,7 @@ class Reflector:
             if is_correction:
                 pref["confidence"] = max(0.0, pref.get("confidence", 0.5) - 0.2)
             self._upsert_preference(existing_list, pref)
-            print(f"[MERGE] profile now has {len(current.get('preferences', []))} items")
+            logger.debug(f"[MERGE] profile now has {len(current.get('preferences', []))} items")
         return current
 
     @staticmethod

@@ -42,7 +42,7 @@ class ProfileStore:
         self._memory: dict[str, dict] = {}
 
     def save(self, user_id: str, profile: dict) -> None:
-        print(f"[SAVE] saving profile with {len(profile.get('preferences', []))} preferences")
+        logger.debug(f"[SAVE] saving profile with {len(profile.get('preferences', []))} preferences")
         key = _PROFILE_PREFIX + user_id
         history_key = f"vmm:profile_history:{user_id}"
         if "preferences" in profile:
