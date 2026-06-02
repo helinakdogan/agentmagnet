@@ -32,6 +32,7 @@ from .aggregate_store import AggregateSignalStore
 from .episodic_store import EpisodicStore
 from .knowledge_store import KnowledgeStore
 from .memory_orchestrator import MemoryOrchestrator
+from .consolidation import ConsolidationEngine
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,13 @@ class BehavioralMemory:
             behavioral_store=self._store,
             episodic_store=self._episodic,
             knowledge_store=self._knowledge,
+        )
+
+        # ── Consolidation ─────────────────────────────────────────────
+        self._consolidation = ConsolidationEngine(
+            episodic_store=self._episodic,
+            profile_store=self._store,
+            aggregate_store=self._aggregate,
         )
 
     def add(
@@ -552,6 +560,14 @@ class BehavioralMemory:
         self._store.save(tenant_id, profile)
         self._profile_cache.pop(tenant_id, None)
         return profile
+
+    async def start_consolidation(
+        self,
+        tenant_prefix: str,
+        interval_hours: int = 24,
+    ) -> None:
+        """Start the scheduled consolidation process."""
+        await self._consolidation.schedule(tenant_prefix, interval_hours)
 
     def get_pending_signals(
         self, user_id: str, project_id: str = "default"

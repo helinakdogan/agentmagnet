@@ -25,6 +25,7 @@
 # ═══════════════════════════════════════════════════
 
 import datetime
+import json
 import numpy as np
 from typing import Any
 
@@ -126,7 +127,7 @@ class AggregateSignalStore:
         
         if not lines:
             return ""
-        
+
         return (
             "[Aggregate Prior]\n"
             "Based on anonymized patterns from similar users:\n" +
@@ -134,3 +135,30 @@ class AggregateSignalStore:
             "Note: These are statistical suggestions. "
             "User's own behavior takes priority."
         )
+
+    def store_consolidated_pattern(self, pattern: dict) -> bool:
+        """
+        Stores a cross-user consolidated pattern from ConsolidationEngine.
+        Never overwrites an existing entry that has equal or higher confidence.
+        Returns True if written, False if skipped.
+        """
+        if not self._redis:
+            return False
+        context = pattern.get("context", "general")
+        relation = pattern.get("relation", "unknown")
+        subject = pattern.get("subject", "").lower().replace(" ", "_")
+        key = f"magnet:consolidated:{context}:{relation}:{subject}"
+        try:
+            existing_raw = self._redis.get(key)
+            if existing_raw:
+                existing = json.loads(existing_raw)
+                if existing.get("confidence", 0.0) >= pattern.get("confidence", 0.0):
+                    return False
+            self._redis.setex(
+                key,
+                60 * 60 * 24 * 90,
+                json.dumps(pattern, ensure_ascii=False),
+            )
+            return True
+        except Exception:
+            return False
