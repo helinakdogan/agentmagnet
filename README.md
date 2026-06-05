@@ -54,7 +54,7 @@ response = client.chat.completions.create(
 ### SDK Mode
 
 ```bash
-pip install git+https://github.com/helinakdogan/magnet-gateway#subdirectory=sdk
+pip install agent-magnet
 ```
 
 ```python
