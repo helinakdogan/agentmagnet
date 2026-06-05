@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "agent-magnet": {
+      "command": "python3.10",
+      "args": ["-m", "magnet.mcp_server"],
+      "env": {
+        "MAGNET_REDIS_URL": "your_redis_url",
+        "MAGNET_OPENAI_KEY": "your_key"
+      }
+    }
+  }
+}

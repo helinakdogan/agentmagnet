@@ -23,5 +23,6 @@ test_sdk_live.py
 reset_dbs.py
 simulate_conversation.py
 inspect_memory.py
-
+CLAUDE.md
+venv310
 
