@@ -3,12 +3,23 @@
 </p>
 
 <p align="center">
-  <a href="https://agentmagnet.app/docs"><img src="https://img.shields.io/badge/Docs-agentmagnet.app-FFD700?style=for-the-badge" alt="Documentation"></a>
-  <a href="https://github.com/helinakdogan/magnet-gateway/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
-  <a href="https://agentmagnet.app"><img src="https://img.shields.io/badge/Built%20by-Agent%20Magnet-blueviolet?style=for-the-badge" alt="Built by Agent Magnet"></a>
-  <img src="https://img.shields.io/pypi/v/magnet-gateway" alt="PyPI">
-  <img src="https://img.shields.io/github/stars/helinakdogan/magnet-gateway" alt="Stars">
-  <img src="https://img.shields.io/github/last-commit/helinakdogan/magnet-gateway" alt="Last Commit">
+  <a href="https://agentmagnet.app/docs">
+    <img src="https://img.shields.io/badge/Docs-agentmagnet.app-8B5CF6?style=for-the-badge">
+  </a>
+
+  <a href="https://github.com/helinakdogan/magnet-gateway/blob/main/LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-A855F7?style=for-the-badge">
+  </a>
+
+  <a href="https://agentmagnet.app">
+    <img src="https://img.shields.io/badge/Built%20by-Agent%20Magnet-C084FC?style=for-the-badge">
+  </a>
+
+<img src="https://img.shields.io/pypi/v/agent-magnet?label=PyPI&labelColor=111827&color=8B5CF6" alt="PyPI">
+
+
+
+<img src="https://img.shields.io/github/last-commit/helinakdogan/magnet-gateway?label=Last%20commit&labelColor=111827&color=C084FC" alt="Last Commit">
 </p>
 
 > Your AI forgets every user the moment the session ends.
