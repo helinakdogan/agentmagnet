@@ -3,15 +3,20 @@
 </p>
 
 <p align="center">
-  <a href="https://agentmagnet.app/docs"><img src="https://img.shields.io/badge/Docs-agentmagnet.app-FFD700?style=for-the-badge" alt="Documentation"></a>
-  <a href="https://github.com/helinakdogan/magnet-gateway/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
-  <a href="https://agentmagnet.app"><img src="https://img.shields.io/badge/Built%20by-Agent%20Magnet-blueviolet?style=for-the-badge" alt="Built by Agent Magnet"></a>
-  <img src="https://img.shields.io/pypi/v/magnet-gateway" alt="PyPI">
-  <img src="https://img.shields.io/github/stars/helinakdogan/magnet-gateway" alt="Stars">
-  <img src="https://img.shields.io/github/last-commit/helinakdogan/magnet-gateway" alt="Last Commit">
+  <a href="https://agentmagnet.app/docs">
+    <img src="https://img.shields.io/badge/Docs-agentmagnet.app-8B5CF6?style=for-the-badge">
+  </a>
+  <a href="https://github.com/helinakdogan/magnet-gateway/blob/main/LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-A855F7?style=for-the-badge">
+  </a>
+  <a href="https://agentmagnet.app">
+    <img src="https://img.shields.io/badge/Built%20by-Agent%20Magnet-C084FC?style=for-the-badge">
+  </a>
+  <img src="https://img.shields.io/pypi/v/agent-magnet?label=PyPI&labelColor=111827&color=8B5CF6" alt="PyPI">
+  <img src="https://img.shields.io/github/last-commit/helinakdogan/magnet-gateway?label=Last%20commit&labelColor=111827&color=C084FC" alt="Last Commit">
 </p>
 
-> Your AI forgets every user the moment the session ends.
+> Your AI forgets every user the moment the session ends.  
 > Magnet fixes that — without changing your code.
 
 ---
@@ -20,38 +25,65 @@
 
 `User sends message → Magnet injects memory → LLM responds → Magnet learns`
 
-- Learns from corrections, not just conversations
-- Builds a profile that gets smarter with every interaction
-- Compresses thousands of messages into a lightweight JSON snapshot
+- Learns from corrections, rejections, and implicit patterns — not just conversations
+- Builds a persistent profile that improves with every interaction
+- Knows what to forget: permanent, contextual, and transient signals decay at different rates
+- Cross-user learning: patterns from one user improve cold-start for the next
 
 ---
 
-## Quick Start
+## Two Ways to Integrate
 
-### Proxy Mode (2 steps)
+### 1. Proxy Mode — zero code changes
 
-```bash
-# Step 1: Start services
-docker compose up -d
-```
+Works with **OpenAI, Anthropic, Google Gemini**, and any OpenAI-compatible client.
 
 ```python
-# Step 2: Change your base URL — nothing else
-import openai
+from openai import OpenAI
 
-client = openai.Client(
-    base_url="http://localhost:8000/v1",
-    api_key="your-openai-api-key"
+client = OpenAI(
+    api_key="mg_sk_...",
+    base_url="https://magnet-gateway.onrender.com/v1",
+    default_headers={"x-session-id": "user_123"}
 )
 
 response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "Hello!"}],
-    extra_headers={"x-session-id": "user-123"}  # Magnet tracks memory per user
+    model="openai/gpt-4o-mini",  # or anthropic/claude-haiku-4-5, google/gemini-flash
+    messages=[{"role": "user", "content": "Hello"}]
 )
 ```
 
-### SDK Mode
+Get your API key: **[agentmagnet.app](https://agentmagnet.app)**
+
+### 2. MCP Server — self-hosted, your data stays with you
+
+Works with **Claude Desktop, Cursor**, and any MCP client.
+
+```bash
+pip install agent-magnet
+```
+
+```json
+{
+  "mcpServers": {
+    "agent-magnet": {
+      "command": "agent-magnet-mcp",
+      "env": {
+        "MAGNET_REDIS_URL": "your_redis_url",
+        "MAGNET_OPENAI_KEY": "your_openai_key"
+      }
+    }
+  }
+}
+```
+
+**MCP tools available:**
+- `get_profile` — get the learned memory profile for a user
+- `inject_memory` — get a memory string ready to inject into system prompt
+- `add_signal` — record a behavioral signal (correction, rejection, preference)
+- `get_cold_start` — get an onboarding profile for a new user based on aggregate patterns
+
+### 3. SDK Mode — deep integration
 
 ```bash
 pip install agent-magnet
@@ -62,10 +94,7 @@ from magnet import BehavioralMemory
 
 memory = BehavioralMemory(reflector_model="openai/gpt-4o-mini")
 
-# Get context for a user
 context = memory.get_injection(user_id="alice")
-
-# Add a conversation to memory
 memory.add(messages, user_id="alice")
 ```
 
@@ -73,57 +102,54 @@ memory.add(messages, user_id="alice")
 
 ## Why Magnet
 
-| | Traditional RAG | Magnet |
-|---|---|---|
-| **Setup** | Vector DB + embeddings + retrieval pipeline | ✅ Drop-in proxy or one import |
-| **Latency** | Adds retrieval roundtrip on every call | ✅ O(1) injection, async learning |
-| **Learning** | Static — you update it manually | ✅ Adapts from every interaction |
-| **Privacy** | Shared embedding pool | ✅ Per-user, self-hosted, no data sharing |
+| | Traditional RAG | Mem0 / Zep | Magnet |
+|---|---|---|---|
+| **Setup** | Weeks | Days (SDK) | ✅ 1 minute |
+| **Learning** | Static | Explicit only | ✅ From behavior |
+| **Forgetting** | None | None | ✅ Multi-parameter decay |
+| **Cross-user learning** | No | No | ✅ Consolidation engine |
+| **Model support** | Any | Any | ✅ OpenAI, Anthropic, Gemini |
+| **Self-hosted** | Yes | Partial | ✅ MCP + on-premise SDK |
 
 ---
 
 ## Architecture
 
-Your AI remembers what matters across three layers — each one builds on the last.
+Three memory layers — each one builds on the last.
 
-**Layer 1 — Redis** (always on, real-time preferences and corrections)  
-**Layer 2 — Qdrant** (episodic recall, semantic memory from past sessions)  
-**Layer 3 — Neo4j** (relationships and long-term knowledge graph)
+**Layer 1 — Behavioral (Redis)**  
+Always on, zero latency. Learns preferences, corrections, and rejections in real time. Signals decay by type: permanent (e.g. "hates mushrooms"), contextual (e.g. "prefers bullet lists"), transient (e.g. "wants short answers today").
+
+**Layer 2 — Episodic (Qdrant)**  
+Semantic recall from past sessions. Triggered only when relevant — no bloat, no noise.
+
+**Layer 3 — Knowledge (Neo4j)**  
+Long-term entity relationships. `PREFERRED_BY`, `REJECTED_BY`, `EXPECTED_BY` — structured understanding of who the user is.
+
+**Consolidation Engine**  
+Runs every 24 hours. Extracts cross-user patterns anonymously. New users don't start from zero.
 
 ---
 
 ## Configuration
 
-Set these in your `.env` file:
-
 | Variable | Description |
 |----------|-------------|
-| `OPENAI_API_KEY` | Used by the reflector model to analyze interactions. |
-| `REDIS_URL` | e.g. `redis://localhost:6379`. Used for Layer 1. |
-| `QDRANT_URL` | Used for Layer 2 episodic memory. |
-| `NEO4J_URL` | Used for Layer 3 graph knowledge. |
+| `MAGNET_REDIS_URL` | Redis for behavioral layer |
+| `MAGNET_OPENAI_KEY` | Used by the reflector model |
+| `QDRANT_URL` | Episodic memory layer |
+| `NEO4J_URL` | Knowledge graph layer |
 
 ---
 
 ## Documentation
 
-Full docs at **[agentmagnet.app/docs](https://agentmagnet.app/docs)**:
-
-| Section | What's Covered |
-|---------|---------------|
-| **Quickstart** | Install → setup → first interaction in 2 minutes |
-| **Architecture** | Details on the 3-layer memory engine |
-| **Proxy Mode** | How to use Magnet as a transparent gateway |
-| **SDK Usage** | Deep integration into Python applications |
-| **Self Hosting** | Instructions for running Redis, Qdrant, and Neo4j |
+Full docs at **[agentmagnet.app/docs](https://agentmagnet.app/docs)**
 
 ---
 
 ## Contributing
 
-Open an issue or submit a pull request — check `CONTRIBUTING.md` for guidelines.
-
-- **Discord**: [Join our Community](#) *(Coming Soon!)*
 - **Issues**: [Report a bug or request a feature](https://github.com/helinakdogan/magnet-gateway/issues)
 - **X**: [@AgentMagnetAI](https://twitter.com/AgentMagnetAI)
 
@@ -135,6 +161,4 @@ If Magnet saved you from a bad context window, give it a ⭐
 
 MIT — see [LICENSE](LICENSE). Built by [Agent Magnet](https://agentmagnet.app).
 
----
-
-<!-- Topics: ai-agent, llm, memory, personalization, openai, python, self-hosted, rag-alternative -->
+<!-- Topics: ai-agent-memory, llm-memory, persistent-memory, mcp-server, openai-proxy, anthropic, gemini, self-hosted-ai, rag-alternative, multi-agent, cross-session-memory, behavioral-learning, python, langchain, crewai -->
