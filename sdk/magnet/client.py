@@ -94,6 +94,8 @@ class BehavioralMemory:
         # share the same user profile without the caller passing user_id explicitly.
         self._default_user_id = os.environ.get("MAGNET_USER_ID")
 
+        self._redis = redis_client
+
         if openai_client is not None:
             logger.warning("BehavioralMemory: openai_client deprecated, ignoring.")
         if anthropic_client is not None:
@@ -562,6 +564,75 @@ class BehavioralMemory:
             tenant_id=tenant_id,
             current_messages=current_messages,
         )
+
+    def session_end(
+        self,
+        user_id: str | None = None,
+        project_id: str = "default",
+        messages: list[dict] | None = None,
+        max_messages: int = 20,
+    ) -> dict:
+        """
+        Summarizes the session and saves it as a high-importance episode.
+
+        Calls the LLM to extract key decisions, preferences, and context from
+        the last `max_messages` turns, then stores the result in EpisodicStore
+        (importance=0.9) and in Redis under a 30-day TTL key for quick recall.
+
+        Returns:
+            {"status": "ok", "summary": str}
+        """
+        import litellm  # already a project dependency
+
+        user_id = self._resolve_user_id(user_id)
+        tenant_id = f"{project_id}:{user_id}"
+        tail = (messages or [])[-max_messages:]
+
+        if not tail:
+            return {"status": "ok", "summary": ""}
+
+        convo = "\n".join(
+            f"{m['role'].upper()}: {m.get('content', '')}"
+            for m in tail
+            if m.get("content")
+        )
+        prompt = (
+            "Extract key decisions, learned preferences, and important context "
+            "from this conversation. Be specific. Format as bullet points.\n\n"
+            + convo
+        )
+
+        try:
+            kwargs: dict = {
+                "model": getattr(self._reflector, "model", "openai/gpt-4o-mini"),
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if self._byok_openai_key:
+                kwargs["api_key"] = self._byok_openai_key
+            response = litellm.completion(**kwargs)
+            summary = response.choices[0].message.content or ""
+        except Exception as e:
+            logger.error(f"session_end(): LLM summarization failed: {e}")
+            summary = self._episodic._auto_summarize(tail)
+
+        # Layer 2 — high-importance episode
+        self._episodic.store_episode(
+            tenant_id=tenant_id,
+            messages=tail,
+            summary=summary,
+            importance=0.9,
+        )
+
+        # Redis fast-lookup with 30-day TTL
+        if self._redis:
+            self._redis.set(
+                f"magnet:session_summary:{tenant_id}",
+                summary,
+                ex=60 * 60 * 24 * 30,
+            )
+
+        logger.info(f"session_end(): session summarized for {tenant_id}")
+        return {"status": "ok", "summary": summary}
 
     def force_reflect(self, user_id: str | None = None, project_id: str = "default") -> dict:
         """
