@@ -68,6 +68,63 @@ def _get_memory() -> Any:
 app = Server("agent-magnet")
 
 
+@app.list_prompts()
+async def list_prompts() -> list[types.Prompt]:
+    return [
+        types.Prompt(
+            name="load-memory",
+            description="Load your memory profile into this conversation",
+            arguments=[
+                types.PromptArgument(
+                    name="user_id",
+                    description="Your user ID (leave blank to use MAGNET_USER_ID env var)",
+                    required=False,
+                ),
+                types.PromptArgument(
+                    name="project_id",
+                    description="Project ID (default: 'default')",
+                    required=False,
+                ),
+            ],
+        )
+    ]
+
+
+@app.get_prompt()
+async def get_prompt(name: str, arguments: dict | None) -> types.GetPromptResult:
+    if name != "load-memory":
+        raise ValueError(f"Unknown prompt: {name}")
+
+    arguments = arguments or {}
+    user_id = arguments.get("user_id") or os.environ.get("MAGNET_USER_ID", "default_user")
+    project_id = arguments.get("project_id") or "default"
+
+    result = await _handle_inject_memory(user_id, project_id, None)
+    injection = result.get("injection", "")
+
+    if injection:
+        content = (
+            "Here is my memory profile — learned from my past behavior. "
+            "Use this context silently throughout the conversation:\n\n"
+            + injection
+        )
+    else:
+        content = (
+            "No memory profile found for me yet. "
+            "Learn my preferences as we talk and remember them for next time."
+        )
+
+    return types.GetPromptResult(
+        description="Behavioral memory profile",
+        messages=[
+            types.PromptMessage(
+                role="user",
+                content=types.TextContent(type="text", text=content),
+            )
+        ],
+    )
+
+
 @app.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
