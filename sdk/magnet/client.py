@@ -90,6 +90,10 @@ class BehavioralMemory:
         self._byok_openai_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
         self._byok_anthropic_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
 
+        # Cross-tool identity: MAGNET_USER_ID lets Claude Code, Cursor, Codex, etc.
+        # share the same user profile without the caller passing user_id explicitly.
+        self._default_user_id = os.environ.get("MAGNET_USER_ID")
+
         if openai_client is not None:
             logger.warning("BehavioralMemory: openai_client deprecated, ignoring.")
         if anthropic_client is not None:
@@ -175,10 +179,16 @@ class BehavioralMemory:
             aggregate_store=self._aggregate,
         )
 
+    def _resolve_user_id(self, user_id: str | None) -> str:
+        resolved = user_id or self._default_user_id
+        if not resolved:
+            raise ValueError("user_id is required (or set MAGNET_USER_ID env variable)")
+        return resolved
+
     def add(
         self,
         messages: list[dict],
-        user_id: str,
+        user_id: str | None = None,
         project_id: str = "default",
         session_id: str | None = None,
         metadata: dict | None = None,
@@ -197,6 +207,7 @@ class BehavioralMemory:
         Returns:
             dict: Result containing routing information if a router is configured.
         """
+        user_id = self._resolve_user_id(user_id)
         tenant_id = f"{project_id}:{user_id}"
         result = {}
 
@@ -321,13 +332,14 @@ class BehavioralMemory:
     async def async_add(
         self,
         messages: list[dict],
-        user_id: str,
+        user_id: str | None = None,
         project_id: str = "default",
         session_id: str | None = None,
         metadata: dict | None = None,
         **kwargs,
     ) -> dict:
         """Asynchronous version of the `add` method."""
+        user_id = self._resolve_user_id(user_id)
         tenant_id = f"{project_id}:{user_id}"
         result = {}
 
@@ -447,7 +459,7 @@ class BehavioralMemory:
     def search(
         self,
         query: str,
-        user_id: str,
+        user_id: str | None = None,
         project_id: str = "default",
         limit: int = 10,
         **kwargs,
@@ -464,6 +476,7 @@ class BehavioralMemory:
         Returns:
             dict: Contains 'behavioral_context' (injection string) and 'behavioral_profile'.
         """
+        user_id = self._resolve_user_id(user_id)
         tenant_id = f"{project_id}:{user_id}"
         profile = self._store.load(tenant_id)
         if not profile:
@@ -471,22 +484,25 @@ class BehavioralMemory:
         injection = self._reflector.build_injection(profile) if self._inject_profile else ""
         return {"behavioral_context": injection, "behavioral_profile": profile}
 
-    def get_all(self, user_id: str, project_id: str = "default", **kwargs) -> dict:
+    def get_all(self, user_id: str | None = None, project_id: str = "default", **kwargs) -> dict:
         """Retrieves the full behavioral profile for a user."""
+        user_id = self._resolve_user_id(user_id)
         tenant_id = f"{project_id}:{user_id}"
         profile = self._store.load(tenant_id)
         return {"behavioral_profile": profile} if profile else {}
 
-    def delete_all(self, user_id: str, project_id: str = "default", **kwargs) -> dict:
+    def delete_all(self, user_id: str | None = None, project_id: str = "default", **kwargs) -> dict:
         """Deletes all behavioral memory for a user."""
+        user_id = self._resolve_user_id(user_id)
         tenant_id = f"{project_id}:{user_id}"
         self._store.delete(tenant_id)
         self._detector.clear_session(tenant_id)
         self._profile_cache.pop(tenant_id, None)
         return {"deleted": True}
 
-    def get_profile(self, user_id: str, project_id: str = "default") -> dict | None:
+    def get_profile(self, user_id: str | None = None, project_id: str = "default") -> dict | None:
         """Retrieves a user's behavioral profile, using a time-based cache."""
+        user_id = self._resolve_user_id(user_id)
         tenant_id = f"{project_id}:{user_id}"
         now = time.time()
         cached = self._profile_cache.get(tenant_id)
@@ -500,7 +516,7 @@ class BehavioralMemory:
 
     def get_injection(
         self,
-        user_id: str,
+        user_id: str | None = None,
         project_id: str = "default",
         current_messages: list[dict] | None = None,
     ) -> str:
@@ -520,6 +536,7 @@ class BehavioralMemory:
         Returns:
             Combined context string. Returns aggregate cold-start if no profile exists.
         """
+        user_id = self._resolve_user_id(user_id)
         tenant_id = f"{project_id}:{user_id}"
 
         # Use the last user message as the query
@@ -546,11 +563,12 @@ class BehavioralMemory:
             current_messages=current_messages,
         )
 
-    def force_reflect(self, user_id: str, project_id: str = "default") -> dict:
+    def force_reflect(self, user_id: str | None = None, project_id: str = "default") -> dict:
         """
         Triggers the reflection process immediately, bypassing the signal threshold.
         Useful for debugging and testing purposes.
         """
+        user_id = self._resolve_user_id(user_id)
         tenant_id = f"{project_id}:{user_id}"
         signals = self._buffer.flush(tenant_id)
         if not signals:
@@ -570,22 +588,24 @@ class BehavioralMemory:
         await self._consolidation.schedule(tenant_prefix, interval_hours)
 
     def get_pending_signals(
-        self, user_id: str, project_id: str = "default"
+        self, user_id: str | None = None, project_id: str = "default"
     ) -> list[dict]:
         """Returns the list of signals currently in the buffer for a user."""
+        user_id = self._resolve_user_id(user_id)
         tenant_id = f"{project_id}:{user_id}"
         return self._buffer.peek(tenant_id)
 
     def get_recommended_model(
         self,
-        user_id: str,
-        messages: list[dict],
+        user_id: str | None = None,
+        messages: list[dict] = [],
         project_id: str = "default",
     ) -> RouterDecision | None:
         """Recommends the optimal model for a given request using the router."""
         if not self.router:
             return None
-        profile = self.get_profile(project_id, user_id)
+        user_id = self._resolve_user_id(user_id)
+        profile = self.get_profile(user_id, project_id)
         return self.router.route(messages, profile)
 
     async def _reflect_async(self, tenant_id: str) -> None:
