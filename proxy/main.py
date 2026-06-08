@@ -191,6 +191,7 @@ async def chat_completions(
         "temperature": 0.7
     }]),
     x_session_id: str = Header("default_session"),
+    x_magnet_user_id: str | None = Header(None),
     auth_data: dict = Depends(verify_api_key)
 ):
     if not _check_rate_limit(auth_data["api_key_id"]):
@@ -208,10 +209,14 @@ async def chat_completions(
             }
         )
 
-    # Scope the session ID to its project so cross-project collisions are impossible
-    # and a caller cannot target another user's profile by guessing a session ID.
+    # X-Magnet-User-ID enables cross-tool identity (Claude Code, Cursor, Codex, etc.).
+    # Falls back to x-session-id when the header is absent.
+    raw_user_id = x_magnet_user_id or x_session_id
+
+    # Scope the raw ID to its project so cross-project collisions are impossible
+    # and a caller cannot target another user's profile by guessing an ID.
     tenant_user_id = hashlib.sha256(
-        f"{auth_data['project_id']}:{x_session_id}".encode()
+        f"{auth_data['project_id']}:{raw_user_id}".encode()
     ).hexdigest()[:32]
 
     messages = body.get("messages", [])
