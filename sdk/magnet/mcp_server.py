@@ -143,6 +143,30 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["project_id"],
             },
         ),
+        types.Tool(
+            name="end_session",
+            description="Summarize and save current session to memory",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "User identifier"},
+                    "project_id": {"type": "string", "description": "Project identifier"},
+                    "messages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "role": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["role", "content"],
+                        },
+                        "description": "Conversation messages to summarize",
+                    },
+                },
+                "required": ["user_id", "project_id", "messages"],
+            },
+        ),
     ]
 
 
@@ -171,6 +195,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             result = await _handle_get_cold_start(
                 arguments["project_id"],
                 arguments.get("context"),
+            )
+        elif name == "end_session":
+            result = await _handle_end_session(
+                arguments["user_id"],
+                arguments["project_id"],
+                arguments["messages"],
             )
         else:
             result = {"error": f"Unknown tool: {name}"}
@@ -286,6 +316,11 @@ async def _handle_add_signal(
         "buffer_count": count,
         "reflected": reflected,
     }
+
+
+async def _handle_end_session(user_id: str, project_id: str, messages: list[dict]) -> dict:
+    memory = _get_memory()
+    return await asyncio.to_thread(memory.session_end, user_id, project_id, messages)
 
 
 async def _handle_get_cold_start(project_id: str, context: str | None) -> dict:
