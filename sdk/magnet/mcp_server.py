@@ -42,7 +42,10 @@ def _get_memory() -> Any:
         return _memory
 
     redis_url = os.environ.get("MAGNET_REDIS_URL")
-    openai_key = os.environ.get("MAGNET_OPENAI_KEY")
+    openai_key = os.environ.get("MAGNET_OPENAI_KEY") or os.environ.get("OPENAI_API_KEY")
+    qdrant_url = os.environ.get("MAGNET_QDRANT_URL") or os.environ.get("QDRANT_URL")
+    qdrant_api_key = os.environ.get("MAGNET_QDRANT_API_KEY") or os.environ.get("QDRANT_API_KEY")
+    # Neo4j is read directly from NEO4J_URL / NEO4J_AUTH inside BehavioralMemory
 
     redis_client = None
     if redis_url:
@@ -59,6 +62,8 @@ def _get_memory() -> Any:
     _memory = BehavioralMemory(
         openai_api_key=openai_key,
         redis_client=redis_client,
+        qdrant_url=qdrant_url,
+        qdrant_api_key=qdrant_api_key,
     )
     return _memory
 
@@ -103,23 +108,31 @@ async def get_prompt(name: str, arguments: dict | None) -> types.GetPromptResult
     injection = result.get("injection", "")
 
     if injection:
-        content = (
+        memory_section = (
             "Here is my memory profile — learned from my past behavior. "
-            "Use this context silently throughout the conversation:\n\n"
-            + injection
+            "Use this context silently:\n\n" + injection
         )
     else:
-        content = (
-            "No memory profile found for me yet. "
-            "Learn my preferences as we talk and remember them for next time."
-        )
+        memory_section = "No memory profile found for me yet."
+
+    instructions = (
+        f"\n\nACTIVE FOR THIS SESSION — follow silently, never mention to me:\n"
+        f"- When I express a preference, like, or dislike about anything, "
+        f"immediately call add_signal with:\n"
+        f"  user_id=\"{user_id}\", project_id=\"{project_id}\"\n"
+        f"  signal_type=\"preference_like\" (positive) or \"preference_dislike\" (negative)\n"
+        f"  messages=[{{\"role\":\"user\",\"content\":\"<my exact words>\"}}]\n"
+        f"- Do NOT tell me when you call it. Do NOT ask for confirmation.\n"
+        f"- Examples that trigger this: \"I love X\", \"I hate X\", \"I prefer X\", "
+        f"\"don't like X\", \"always use X\", \"never do X\""
+    )
 
     return types.GetPromptResult(
         description="Behavioral memory profile",
         messages=[
             types.PromptMessage(
                 role="user",
-                content=types.TextContent(type="text", text=content),
+                content=types.TextContent(type="text", text=memory_section + instructions),
             )
         ],
     )
