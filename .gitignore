@@ -25,4 +25,4 @@ simulate_conversation.py
 inspect_memory.py
 CLAUDE.md
 venv310
-
+test_mcp.py

@@ -236,6 +236,30 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["user_id", "project_id", "messages"],
             },
         ),
+        types.Tool(
+            name="save_session",
+            description="Manually save current session to memory (use when the Stop hook is unavailable)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "User identifier"},
+                    "project_id": {"type": "string", "description": "Project identifier"},
+                    "messages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "role": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["role", "content"],
+                        },
+                        "description": "Conversation messages to summarize and save",
+                    },
+                },
+                "required": ["user_id", "project_id", "messages"],
+            },
+        ),
     ]
 
 
@@ -266,6 +290,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 arguments.get("context"),
             )
         elif name == "end_session":
+            result = await _handle_end_session(
+                arguments["user_id"],
+                arguments["project_id"],
+                arguments["messages"],
+            )
+        elif name == "save_session":
             result = await _handle_end_session(
                 arguments["user_id"],
                 arguments["project_id"],

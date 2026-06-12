@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/save_session.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
