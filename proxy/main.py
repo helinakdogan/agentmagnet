@@ -209,15 +209,15 @@ async def chat_completions(
             }
         )
 
-    # X-Magnet-User-ID enables cross-tool identity (Claude Code, Cursor, Codex, etc.).
-    # Falls back to x-session-id when the header is absent.
-    raw_user_id = x_magnet_user_id or x_session_id
-
-    # Scope the raw ID to its project so cross-project collisions are impossible
-    # and a caller cannot target another user's profile by guessing an ID.
-    tenant_user_id = hashlib.sha256(
-        f"{auth_data['project_id']}:{raw_user_id}".encode()
-    ).hexdigest()[:32]
+    # When x-magnet-user-id is supplied, use it raw so the profile key
+    # matches what MCP/SDK writes: vmm:profile:{project_id}:{user_id}.
+    # Without it, hash x-session-id to keep anonymous sessions isolated.
+    if x_magnet_user_id:
+        tenant_user_id = x_magnet_user_id
+    else:
+        tenant_user_id = hashlib.sha256(
+            f"{auth_data['project_id']}:{x_session_id}".encode()
+        ).hexdigest()[:32]
 
     messages = body.get("messages", [])
 

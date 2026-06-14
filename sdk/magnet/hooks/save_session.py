@@ -54,6 +54,7 @@ def main() -> None:
         if not user_id:
             return
 
+        project_id = os.environ.get("MAGNET_PROJECT_ID", "default")
         redis_url = os.environ.get("MAGNET_REDIS_URL")
         openai_key = os.environ.get("MAGNET_OPENAI_KEY") or os.environ.get("OPENAI_API_KEY")
 
@@ -68,7 +69,7 @@ def main() -> None:
             openai_api_key=openai_key,
             redis_client=redis_client,
         )
-        memory.session_end(user_id=user_id, messages=normalized)
+        memory.session_end(user_id=user_id, project_id=project_id, messages=normalized)
 
         print("Magnet: session saved")
 

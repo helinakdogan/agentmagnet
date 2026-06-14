@@ -168,7 +168,7 @@ pip install agent-magnet
         "matcher": "",
         "hooks": [{
           "type": "command",
-          "command": "MAGNET_REDIS_URL=your_redis_url MAGNET_OPENAI_KEY=your_openai_key MAGNET_USER_ID=your_name python -m magnet.hooks.save_session",
+          "command": "MAGNET_REDIS_URL=your_redis_url MAGNET_OPENAI_KEY=your_openai_key MAGNET_USER_ID=your_name MAGNET_PROJECT_ID=your_project_uuid python -m magnet.hooks.save_session",
           "timeout": 10
         }]
       }
@@ -187,12 +187,15 @@ pip install agent-magnet
       "env": {
         "MAGNET_REDIS_URL": "your_redis_url",
         "MAGNET_OPENAI_KEY": "your_openai_key",
-        "MAGNET_USER_ID": "your_name"
+        "MAGNET_USER_ID": "your_name",
+        "MAGNET_PROJECT_ID": "your_project_uuid"
       }
     }
   }
 }
 ```
+
+`MAGNET_PROJECT_ID` is the project UUID from your [Agent Magnet dashboard](https://agentmagnet.app). It must match the project your proxy API key belongs to — this is what lets Claude Code and Cursor share the same memory.
 
 5. Restart Claude Code.
 

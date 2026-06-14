@@ -31,6 +31,8 @@ from mcp.server.stdio import stdio_server
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_PROJECT_ID = os.environ.get("MAGNET_PROJECT_ID", "default")
+
 # ── Lazy-init singleton ───────────────────────────────────────────────────────
 
 _memory: Any = None  # BehavioralMemory
@@ -102,7 +104,7 @@ async def get_prompt(name: str, arguments: dict | None) -> types.GetPromptResult
 
     arguments = arguments or {}
     user_id = arguments.get("user_id") or os.environ.get("MAGNET_USER_ID", "default_user")
-    project_id = arguments.get("project_id") or "default"
+    project_id = arguments.get("project_id") or _DEFAULT_PROJECT_ID
 
     result = await _handle_inject_memory(user_id, project_id, None)
     injection = result.get("injection", "")
@@ -147,9 +149,9 @@ async def list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "user_id": {"type": "string", "description": "User identifier"},
-                    "project_id": {"type": "string", "description": "Project identifier"},
+                    "project_id": {"type": "string", "description": "Project identifier (defaults to MAGNET_PROJECT_ID env var)"},
                 },
-                "required": ["user_id", "project_id"],
+                "required": ["user_id"],
             },
         ),
         types.Tool(
@@ -159,13 +161,13 @@ async def list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "user_id": {"type": "string"},
-                    "project_id": {"type": "string"},
+                    "project_id": {"type": "string", "description": "Defaults to MAGNET_PROJECT_ID env var"},
                     "current_message": {
                         "type": "string",
                         "description": "The user's current message (used for episodic retrieval)",
                     },
                 },
-                "required": ["user_id", "project_id"],
+                "required": ["user_id"],
             },
         ),
         types.Tool(
@@ -175,7 +177,7 @@ async def list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "user_id": {"type": "string"},
-                    "project_id": {"type": "string"},
+                    "project_id": {"type": "string", "description": "Defaults to MAGNET_PROJECT_ID env var"},
                     "messages": {
                         "type": "array",
                         "items": {
@@ -194,7 +196,7 @@ async def list_tools() -> list[types.Tool]:
                         "description": "The type of behavioral signal detected",
                     },
                 },
-                "required": ["user_id", "project_id", "messages", "signal_type"],
+                "required": ["user_id", "messages", "signal_type"],
             },
         ),
         types.Tool(
@@ -203,13 +205,13 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_id": {"type": "string"},
+                    "project_id": {"type": "string", "description": "Defaults to MAGNET_PROJECT_ID env var"},
                     "context": {
                         "type": "string",
                         "description": "Current query context (e.g. 'coding', 'writing', 'general_chat')",
                     },
                 },
-                "required": ["project_id"],
+                "required": [],
             },
         ),
         types.Tool(
@@ -219,7 +221,7 @@ async def list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "user_id": {"type": "string", "description": "User identifier"},
-                    "project_id": {"type": "string", "description": "Project identifier"},
+                    "project_id": {"type": "string", "description": "Defaults to MAGNET_PROJECT_ID env var"},
                     "messages": {
                         "type": "array",
                         "items": {
@@ -233,7 +235,7 @@ async def list_tools() -> list[types.Tool]:
                         "description": "Conversation messages to summarize",
                     },
                 },
-                "required": ["user_id", "project_id", "messages"],
+                "required": ["user_id", "messages"],
             },
         ),
         types.Tool(
@@ -243,7 +245,7 @@ async def list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "user_id": {"type": "string", "description": "User identifier"},
-                    "project_id": {"type": "string", "description": "Project identifier"},
+                    "project_id": {"type": "string", "description": "Defaults to MAGNET_PROJECT_ID env var"},
                     "messages": {
                         "type": "array",
                         "items": {
@@ -257,7 +259,7 @@ async def list_tools() -> list[types.Tool]:
                         "description": "Conversation messages to summarize and save",
                     },
                 },
-                "required": ["user_id", "project_id", "messages"],
+                "required": ["user_id", "messages"],
             },
         ),
     ]
@@ -266,39 +268,40 @@ async def list_tools() -> list[types.Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     try:
+        project_id = arguments.get("project_id") or _DEFAULT_PROJECT_ID
         if name == "get_profile":
             result = await _handle_get_profile(
                 arguments["user_id"],
-                arguments["project_id"],
+                project_id,
             )
         elif name == "inject_memory":
             result = await _handle_inject_memory(
                 arguments["user_id"],
-                arguments["project_id"],
+                project_id,
                 arguments.get("current_message"),
             )
         elif name == "add_signal":
             result = await _handle_add_signal(
                 arguments["user_id"],
-                arguments["project_id"],
+                project_id,
                 arguments["messages"],
                 arguments["signal_type"],
             )
         elif name == "get_cold_start":
             result = await _handle_get_cold_start(
-                arguments["project_id"],
+                project_id,
                 arguments.get("context"),
             )
         elif name == "end_session":
             result = await _handle_end_session(
                 arguments["user_id"],
-                arguments["project_id"],
+                project_id,
                 arguments["messages"],
             )
         elif name == "save_session":
             result = await _handle_end_session(
                 arguments["user_id"],
-                arguments["project_id"],
+                project_id,
                 arguments["messages"],
             )
         else:
