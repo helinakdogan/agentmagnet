@@ -202,6 +202,50 @@ Use the same `MAGNET_USER_ID` across Claude Code, Cursor, and Codex to share mem
 
 ---
 
+## Cursor Setup
+
+### Option A — MCP (read memory, manual save)
+
+1. Install:
+
+```bash
+pip install agent-magnet
+```
+
+2. Get a free Redis URL: [upstash.com](https://upstash.com)
+
+3. Add to Cursor MCP config (Settings → MCP):
+
+```json
+{
+  "mcpServers": {
+    "agent-magnet": {
+      "command": "agent-magnet-mcp",
+      "env": {
+        "MAGNET_REDIS_URL": "your_redis_url",
+        "MAGNET_OPENAI_KEY": "your_openai_key",
+        "MAGNET_USER_ID": "your_name"
+      }
+    }
+  }
+}
+```
+
+4. Restart Cursor. Type `load my memory` at the start of a session, and `save this session` at the end.
+
+Use the same `MAGNET_USER_ID` as Claude Code to share memory between tools.
+
+### Option B — Proxy (fully automatic, no manual commands)
+
+1. Go to Cursor Settings → Models → OpenAI API Key
+2. Set "Override OpenAI Base URL" to: `https://magnet-gateway.onrender.com/v1`
+3. Use your Agent Magnet API key (get one at [agentmagnet.app](https://agentmagnet.app))
+4. Add header `x-session-id: your_name` in the same settings
+
+Now every request automatically learns and recalls memory — no manual commands needed. Best for users who want zero friction.
+
+---
+
 ## Contributing
 
 - **Issues**: [Report a bug or request a feature](https://github.com/helinakdogan/magnet-gateway/issues)
