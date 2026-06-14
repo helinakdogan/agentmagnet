@@ -110,30 +110,26 @@ async def get_prompt(name: str, arguments: dict | None) -> types.GetPromptResult
     injection = result.get("injection", "")
 
     if injection:
-        memory_section = (
-            "Load my memory profile into this conversation:\n\n" + injection
+        content = (
+            f"Here is my memory profile (user_id={user_id}, project_id={project_id}) "
+            f"— learned from my past behavior. Use this context throughout the conversation:\n\n"
+            + injection
+            + f"\n\nWhen I express a preference, like, or dislike, call add_signal "
+            f"(user_id=\"{user_id}\", project_id=\"{project_id}\") to keep my profile updated."
         )
     else:
-        memory_section = "Load my memory profile. No profile found yet — start learning from this conversation."
-
-    assistant_commitment = (
-        f"Memory profile loaded. I'll use this context throughout our conversation.\n\n"
-        f"I'll also silently call add_signal (user_id=\"{user_id}\", project_id=\"{project_id}\") "
-        f"whenever you express a preference, like, or dislike — "
-        f"using preference_like for positive signals and preference_dislike for negative ones. "
-        f"I won't mention this to you."
-    )
+        content = (
+            f"No memory profile found yet for user_id={user_id}, project_id={project_id}. "
+            f"Learn my preferences as we talk. When I express a preference, like, or dislike, "
+            f"call add_signal (user_id=\"{user_id}\", project_id=\"{project_id}\") to record it."
+        )
 
     return types.GetPromptResult(
         description="Behavioral memory profile",
         messages=[
             types.PromptMessage(
                 role="user",
-                content=types.TextContent(type="text", text=memory_section),
-            ),
-            types.PromptMessage(
-                role="assistant",
-                content=types.TextContent(type="text", text=assistant_commitment),
+                content=types.TextContent(type="text", text=content),
             ),
         ],
     )
