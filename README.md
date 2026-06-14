@@ -150,15 +150,22 @@ Full docs at **[agentmagnet.app/docs](https://agentmagnet.app/docs)**
 
 ## Claude Code Setup
 
-1. Install:
+How it works end-to-end:
+- **Session start** — Claude automatically reads your memory profile and uses it
+- **During the session** — Claude learns from your corrections, preferences, and rejections
+- **Session end** — a Stop hook saves everything to Redis before Claude Code closes
+
+### Step 1 — Install
 
 ```bash
-pip install agent-magnet
+pipx install agent-magnet
 ```
 
-2. Get a free Redis URL: [upstash.com](https://upstash.com) (takes 1 minute)
+Get a free Redis URL at [upstash.com](https://upstash.com) (takes 1 minute).
 
-3. Add to `~/.claude/settings.json`:
+### Step 2 — Add the Stop hook and MCP server
+
+In `~/.claude/settings.json`:
 
 ```json
 {
@@ -168,19 +175,12 @@ pip install agent-magnet
         "matcher": "",
         "hooks": [{
           "type": "command",
-          "command": "MAGNET_REDIS_URL=your_redis_url MAGNET_OPENAI_KEY=your_openai_key MAGNET_USER_ID=your_name MAGNET_PROJECT_ID=your_project_uuid python -m magnet.hooks.save_session",
+          "command": "MAGNET_REDIS_URL=your_redis_url MAGNET_OPENAI_KEY=your_openai_key MAGNET_USER_ID=your_name MAGNET_PROJECT_ID=default /path/to/pipx/venvs/agent-magnet/bin/python -m magnet.hooks.save_session",
           "timeout": 10
         }]
       }
     ]
-  }
-}
-```
-
-4. Add to the same file (`mcpServers` section, for reading memory):
-
-```json
-{
+  },
   "mcpServers": {
     "agent-magnet": {
       "command": "agent-magnet-mcp",
@@ -188,35 +188,64 @@ pip install agent-magnet
         "MAGNET_REDIS_URL": "your_redis_url",
         "MAGNET_OPENAI_KEY": "your_openai_key",
         "MAGNET_USER_ID": "your_name",
-        "MAGNET_PROJECT_ID": "your_project_uuid"
+        "MAGNET_PROJECT_ID": "default"
       }
     }
   }
 }
 ```
 
-`MAGNET_PROJECT_ID` is the project UUID from your [Agent Magnet dashboard](https://agentmagnet.app). It must match the project your proxy API key belongs to — this is what lets Claude Code and Cursor share the same memory.
+To find your pipx Python path: `pipx environment | grep PIPX_HOME`  
+Then the full path is: `{PIPX_HOME}/venvs/agent-magnet/bin/python`
 
-5. Restart Claude Code.
+### Step 3 — Tell Claude to load memory automatically
 
-Done. Magnet now saves what it learns when a session ends, and loads it when a new session starts — type `load my memory` to load manually, or it happens automatically via the hook.
+Create `~/.claude/CLAUDE.md` (global instructions Claude reads at the start of every session):
+
+```markdown
+# Memory
+
+At the start of every conversation, call the `inject_memory` MCP tool (agent-magnet) with:
+- user_id: "your_name"
+- project_id: "default"
+
+Use the returned memory profile as context for the conversation.
+```
+
+This is the critical step. Without it, memory is saved but never loaded into the conversation.
+
+### Step 4 — Restart Claude Code
+
+That's it. From now on:
+- Every new conversation starts with your memory profile loaded
+- Every closed session is saved automatically
+- No manual commands needed
 
 Use the same `MAGNET_USER_ID` across Claude Code, Cursor, and Codex to share memory between tools.
+
+### What you can say during a session
+
+Memory loads automatically at the start, but Claude doesn't always proactively record things mid-session. These phrases work reliably:
+
+| What you want | What to say |
+|---|---|
+| Load your profile into this conversation | `get my data from agent-magnet` |
+| Save something you just said | `record it to agent-magnet` |
+| Save the whole session now | `save this session to my memory` |
+| Check what Magnet knows about you | `what's in my agent-magnet profile` |
+
+You don't need exact phrasing — Claude understands intent and will call the right MCP tool. But if it doesn't, these always work.
 
 ---
 
 ## Cursor Setup
 
-### Option A — MCP (read memory, manual save)
+### Option A — MCP (automatic load, manual save)
 
-1. Install:
+Cursor doesn't support Stop hooks, so sessions must be saved manually.
 
-```bash
-pip install agent-magnet
-```
-
-2. Get a free Redis URL: [upstash.com](https://upstash.com)
-
+1. Install: `pipx install agent-magnet`
+2. Get a free Redis URL at [upstash.com](https://upstash.com)
 3. Add to Cursor MCP config (Settings → MCP):
 
 ```json
@@ -227,25 +256,32 @@ pip install agent-magnet
       "env": {
         "MAGNET_REDIS_URL": "your_redis_url",
         "MAGNET_OPENAI_KEY": "your_openai_key",
-        "MAGNET_USER_ID": "your_name"
+        "MAGNET_USER_ID": "your_name",
+        "MAGNET_PROJECT_ID": "default"
       }
     }
   }
 }
 ```
 
-4. Restart Cursor. Type `load my memory` at the start of a session, and `save this session` at the end.
+4. Add to Cursor Rules (Settings → Rules for AI):
 
-Use the same `MAGNET_USER_ID` as Claude Code to share memory between tools.
+```
+At the start of every conversation, call the inject_memory MCP tool (agent-magnet) with user_id="your_name" and project_id="default". Use the result as context.
+```
 
-### Option B — Proxy (fully automatic, no manual commands)
+5. At the end of a session, type: `save this session to my memory`
 
-1. Go to Cursor Settings → Models → OpenAI API Key
+Use the same `MAGNET_USER_ID` as Claude Code — memory is shared across tools.
+
+### Option B — Proxy (fully automatic)
+
+1. Go to Cursor Settings → Models
 2. Set "Override OpenAI Base URL" to: `https://magnet-gateway.onrender.com/v1`
-3. Use your Agent Magnet API key (get one at [agentmagnet.app](https://agentmagnet.app))
-4. Add header `x-session-id: your_name` in the same settings
+3. Enter your Agent Magnet API key from [agentmagnet.app](https://agentmagnet.app)
+4. Add header: `x-magnet-user-id: your_name`
 
-Now every request automatically learns and recalls memory — no manual commands needed. Best for users who want zero friction.
+Every request automatically saves and recalls memory. No manual commands, no setup beyond this.
 
 ---
 

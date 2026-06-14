@@ -111,18 +111,10 @@ async def get_prompt(name: str, arguments: dict | None) -> types.GetPromptResult
 
     if injection:
         content = (
-            f"Here is my memory profile (user_id={user_id}, project_id={project_id}) "
-            f"— learned from my past behavior. Use this context throughout the conversation:\n\n"
-            + injection
-            + f"\n\nWhen I express a preference, like, or dislike, call add_signal "
-            f"(user_id=\"{user_id}\", project_id=\"{project_id}\") to keep my profile updated."
+            f"Memory profile for {user_id}:\n\n" + injection
         )
     else:
-        content = (
-            f"No memory profile found yet for user_id={user_id}, project_id={project_id}. "
-            f"Learn my preferences as we talk. When I express a preference, like, or dislike, "
-            f"call add_signal (user_id=\"{user_id}\", project_id=\"{project_id}\") to record it."
-        )
+        content = f"No memory profile found yet for {user_id}."
 
     return types.GetPromptResult(
         description="Behavioral memory profile",
