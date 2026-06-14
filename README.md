@@ -148,6 +148,60 @@ Full docs at **[agentmagnet.app/docs](https://agentmagnet.app/docs)**
 
 ---
 
+## Claude Code Setup
+
+1. Install:
+
+```bash
+pip install agent-magnet
+```
+
+2. Get a free Redis URL: [upstash.com](https://upstash.com) (takes 1 minute)
+
+3. Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [{
+          "type": "command",
+          "command": "MAGNET_REDIS_URL=your_redis_url MAGNET_OPENAI_KEY=your_openai_key MAGNET_USER_ID=your_name python -m magnet.hooks.save_session",
+          "timeout": 10
+        }]
+      }
+    ]
+  }
+}
+```
+
+4. Add to the same file (`mcpServers` section, for reading memory):
+
+```json
+{
+  "mcpServers": {
+    "agent-magnet": {
+      "command": "agent-magnet-mcp",
+      "env": {
+        "MAGNET_REDIS_URL": "your_redis_url",
+        "MAGNET_OPENAI_KEY": "your_openai_key",
+        "MAGNET_USER_ID": "your_name"
+      }
+    }
+  }
+}
+```
+
+5. Restart Claude Code.
+
+Done. Magnet now saves what it learns when a session ends, and loads it when a new session starts — type `load my memory` to load manually, or it happens automatically via the hook.
+
+Use the same `MAGNET_USER_ID` across Claude Code, Cursor, and Codex to share memory between tools.
+
+---
+
 ## Contributing
 
 - **Issues**: [Report a bug or request a feature](https://github.com/helinakdogan/magnet-gateway/issues)
