@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "app.agentmagnet/agent-magnet",
   "description": "Self-learning behavioral memory for AI tools. Learns user preferences, corrections, and patterns across Claude Code, Cursor, and Codex without changing client code. Tools: get_profile, inject_memory, add_signal, get_cold_start, end_session, save_session. Supports local SQLite storage (zero external dependencies) or Redis/Qdrant/Neo4j for teams.",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "agent-magnet",
-      "version": "0.1.9",
+      "version": "0.1.10",
       "command": "agent-magnet-mcp",
       "transport": {
         "type": "stdio"
