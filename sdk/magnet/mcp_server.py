@@ -44,6 +44,7 @@ def _get_memory() -> Any:
         return _memory
 
     redis_url = os.environ.get("MAGNET_REDIS_URL")
+    local_mode = os.environ.get("MAGNET_LOCAL_MODE", "").lower() in ("1", "true", "yes")
     openai_key = os.environ.get("MAGNET_OPENAI_KEY") or os.environ.get("OPENAI_API_KEY")
     qdrant_url = os.environ.get("MAGNET_QDRANT_URL") or os.environ.get("QDRANT_URL")
     qdrant_api_key = os.environ.get("MAGNET_QDRANT_API_KEY") or os.environ.get("QDRANT_API_KEY")
@@ -58,6 +59,10 @@ def _get_memory() -> Any:
         except Exception as e:
             logger.warning(f"Redis unavailable ({e}); running in-memory only")
             redis_client = None
+    elif local_mode:
+        from magnet.local_store import SQLiteBackend
+        redis_client = SQLiteBackend()
+        logger.info("Local mode: using SQLite storage at ~/.agent-magnet/memory.db")
 
     from magnet.client import BehavioralMemory
 
@@ -66,6 +71,7 @@ def _get_memory() -> Any:
         redis_client=redis_client,
         qdrant_url=qdrant_url,
         qdrant_api_key=qdrant_api_key,
+        enable_aggregate=not local_mode,
     )
     return _memory
 

@@ -24,7 +24,9 @@ dependencies = [
 dev = ["pytest>=8.0", "pytest-asyncio"]
 
 [project.scripts]
+agent-magnet = "magnet.cli:main"
 agent-magnet-mcp = "magnet.mcp_server:main"
+agent-magnet-hook = "magnet.hooks.save_session:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

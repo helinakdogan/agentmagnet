@@ -56,18 +56,23 @@ def main() -> None:
 
         project_id = os.environ.get("MAGNET_PROJECT_ID", "default")
         redis_url = os.environ.get("MAGNET_REDIS_URL")
+        local_mode = os.environ.get("MAGNET_LOCAL_MODE", "").lower() in ("1", "true", "yes")
         openai_key = os.environ.get("MAGNET_OPENAI_KEY") or os.environ.get("OPENAI_API_KEY")
 
         redis_client = None
         if redis_url:
             import redis as redis_lib
             redis_client = redis_lib.from_url(redis_url, decode_responses=True)
+        elif local_mode:
+            from magnet.local_store import SQLiteBackend
+            redis_client = SQLiteBackend()
 
         from magnet.client import BehavioralMemory
 
         memory = BehavioralMemory(
             openai_api_key=openai_key,
             redis_client=redis_client,
+            enable_aggregate=False,
         )
         memory.session_end(user_id=user_id, project_id=project_id, messages=normalized)
 

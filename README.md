@@ -270,6 +270,8 @@ Cursor doesn't support Stop hooks, so sessions must be saved manually.
 At the start of every conversation, call the inject_memory MCP tool (agent-magnet) with user_id="your_name" and project_id="default". Use the result as context.
 ```
 
+> **Important:** MCP tools only work in **Agent mode**. In Ask mode, Cursor blocks tool calls. Switch to Agent mode for memory to load and save correctly.
+
 5. At the end of a session, type: `save this session to my memory`
 
 Use the same `MAGNET_USER_ID` as Claude Code — memory is shared across tools.
