@@ -1,0 +1,33 @@
+{
+  "name": "agent-magnet",
+  "title": "Agent Magnet",
+  "description": "Self-learning memory for AI tools. Remembers preferences and context across Claude, Cursor, and Codex.",
+  "version": "0.1.11",
+  "transport": "stdio",
+  "install": {
+    "pip": "agent-magnet",
+    "command": "agent-magnet-mcp"
+  },
+  "environmentVariables": [
+    {
+      "name": "MAGNET_USER_ID",
+      "description": "Your identifier for cross-tool memory",
+      "required": true
+    },
+    {
+      "name": "MAGNET_LOCAL_MODE",
+      "description": "Set to 1 for local storage, no Redis needed",
+      "required": false
+    },
+    {
+      "name": "MAGNET_OPENAI_KEY",
+      "description": "OpenAI API key for reflector model",
+      "required": false
+    }
+  ],
+  "links": {
+    "github": "https://github.com/helinakdogan/magnet-gateway",
+    "homepage": "https://agentmagnet.app",
+    "pypi": "https://pypi.org/project/agent-magnet/"
+  }
+}

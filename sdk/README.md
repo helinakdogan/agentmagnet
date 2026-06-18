@@ -1,5 +1,7 @@
 # Agent Magnet
 
+<!-- mcp-name: io.github.helinakdogan/agent-magnet -->
+
 Self-learning memory infrastructure for AI products.
 It learns from what users do — not what they say.
 

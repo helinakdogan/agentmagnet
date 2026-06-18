@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-magnet"
-version = "0.1.10"
+version = "0.1.11"
 description = "Self-learning memory infrastructure for AI products"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,6 +22,10 @@ dependencies = [
     "neo4j",
     "python-dotenv",
 ]
+
+[project.urls]
+Homepage = "https://agentmagnet.app"
+Repository = "https://github.com/helinakdogan/magnet-gateway"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio"]
