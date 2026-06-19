@@ -35,7 +35,7 @@ OUTPUT FORMAT (only JSON array, write nothing else):
 
 RULES:
 - subject_type: "ingredient" | "format" | "tone" | "creative" | "behavior"
-- relation: "dislikes" | "prefers" | "expects"
+- relation: "dislikes" | "prefers" | "expects" | "watch_out"
 - preference_type:
     ingredient → permanent
     format, behavior → contextual
@@ -361,9 +361,10 @@ class Reflector:
                 pct = int(conf * 100)
                 lines.append(f"  - {k}: {v['value']} (confidence: {pct}%)")
 
-        likes = [(p, c) for p, c in active_prefs if p.get("relation") == "prefers"]
-        dislikes = [(p, c) for p, c in active_prefs if p.get("relation") == "dislikes"]
-        expects = [(p, c) for p, c in active_prefs if p.get("relation") == "expects"]
+        likes     = [(p, c) for p, c in active_prefs if p.get("relation") == "prefers"]
+        dislikes  = [(p, c) for p, c in active_prefs if p.get("relation") == "dislikes"]
+        expects   = [(p, c) for p, c in active_prefs if p.get("relation") == "expects"]
+        watch_out = [(p, c) for p, c in active_prefs if p.get("relation") == "watch_out"]
 
         if likes:
             lines.append("\nThis user likes / approves of:")
@@ -379,6 +380,11 @@ class Reflector:
             lines.append("\nPersonality & communication expectations:")
             for pref, _ in expects[:5]:
                 lines.append(f"  → {pref['natural_text']}")
+
+        if watch_out:
+            lines.append("\n⚠ Watch out — handle with care:")
+            for pref, _ in watch_out[:5]:
+                lines.append(f"  ⚠ {pref['natural_text']}")
 
         patterns = global_prefs.get("patterns", [])
         if isinstance(patterns, list) and patterns:

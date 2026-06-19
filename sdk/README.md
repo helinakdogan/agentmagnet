@@ -37,6 +37,12 @@ Tools available:
 - `inject_memory` — get memory injection string for system prompt
 - `add_signal` — record a behavioral signal
 - `get_cold_start` — get onboarding profile for new users
+- `get_team_profile` — get shared team memory (requires Redis)
+- `get_merged_injection` — merged user + team + org memory injection
+- `get_project_memory` — per-user breakdown of what was learned in a project
+- `share_to_team` — explicitly share a personal preference to team memory
+- `forget_team` — remove a preference from team memory
+- `add_team_signal` — record a signal directly to team scope
 
 ### 2. Proxy (Hosted, Dashboard included)
 Change one line. We handle the infrastructure.
@@ -52,6 +58,52 @@ client = OpenAI(
 ```
 
 Get your API key: agentmagnet.app
+
+## Team Memory
+
+Memory works for individual users out of the box. To share memory across a team, add Redis and a shared `MAGNET_TEAM_ID`.
+
+**Solo (local SQLite, no Redis needed):**
+```bash
+agent-magnet init
+# Use local storage? Y
+# Team ID: (press Enter to skip)
+```
+Each person's preferences are stored privately on their machine.
+
+**Team (shared Redis):**
+```bash
+agent-magnet init
+# Use local storage? N
+# Redis URL: redis://your-redis-host:6379
+# Team ID: acme-eng
+```
+All team members point to the same Redis. Memory is scoped per-user but team-level insights are available.
+
+**What team memory gives you:**
+
+```
+get_project_memory(project_id="acme-app")
+# →
+# {
+#   "contributors": {
+#     "ahmet": {"prefers": ["short responses", "Turkish"], "watch_out": ["never use em-dashes"]},
+#     "ayse":  {"prefers": ["detailed explanations"], "dislikes": ["bullet lists"]}
+#   },
+#   "team_shared": {
+#     "prefers": ["short responses"],   ← promoted because 2+ users share it
+#     "watch_out": []
+#   }
+# }
+```
+
+**Explicitly share a preference to team:**
+```
+share_to_team(user_id="ahmet", fact_or_subject="short responses", team_id="acme-eng")
+```
+
+**Team memory requires Redis.** If you try to use team tools in local mode you'll get:
+> Team memory requires shared storage. Set MAGNET_REDIS_URL for all team members to use the same Redis instance.
 
 ## How It Learns
 

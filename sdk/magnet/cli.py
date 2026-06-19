@@ -99,7 +99,7 @@ def _hook_command(env_pairs: list[tuple[str, str]]) -> str:
 
 # ── MCP server entry builder ───────────────────────────────────────────────────
 
-def _build_mcp_entry(user_id: str, openai_key: str, storage: str, redis_url: str) -> dict:
+def _build_mcp_entry(user_id: str, openai_key: str, storage: str, redis_url: str, team_id: str = "") -> dict:
     env: dict[str, str] = {
         "MAGNET_USER_ID": user_id,
         "MAGNET_PROJECT_ID": "default",
@@ -110,6 +110,8 @@ def _build_mcp_entry(user_id: str, openai_key: str, storage: str, redis_url: str
         env["MAGNET_LOCAL_MODE"] = "1"
     else:
         env["MAGNET_REDIS_URL"] = redis_url
+    if team_id:
+        env["MAGNET_TEAM_ID"] = team_id
 
     return {"command": _mcp_command(), "env": env}
 
@@ -117,14 +119,14 @@ def _build_mcp_entry(user_id: str, openai_key: str, storage: str, redis_url: str
 # ── Per-tool config writers ────────────────────────────────────────────────────
 
 def _write_claude_code(
-    path: Path, user_id: str, openai_key: str, storage: str, redis_url: str
+    path: Path, user_id: str, openai_key: str, storage: str, redis_url: str, team_id: str = ""
 ) -> str:
     config = _read_json(path)
 
     # MCP server
     config.setdefault("mcpServers", {})
     config["mcpServers"]["agent-magnet"] = _build_mcp_entry(
-        user_id, openai_key, storage, redis_url
+        user_id, openai_key, storage, redis_url, team_id
     )
 
     # Stop hook — inline env vars so the hook process can read them
@@ -135,6 +137,8 @@ def _write_claude_code(
         env_pairs.append(("MAGNET_LOCAL_MODE", "1"))
     else:
         env_pairs.append(("MAGNET_REDIS_URL", redis_url))
+    if team_id:
+        env_pairs.append(("MAGNET_TEAM_ID", team_id))
 
     hook_entry: dict[str, Any] = {
         "type": "command",
@@ -164,11 +168,11 @@ def _is_magnet_hook(block: Any) -> bool:
     return False
 
 
-def _write_mcp_only(path: Path, user_id: str, openai_key: str, storage: str, redis_url: str) -> str:
+def _write_mcp_only(path: Path, user_id: str, openai_key: str, storage: str, redis_url: str, team_id: str = "") -> str:
     config = _read_json(path)
     config.setdefault("mcpServers", {})
     config["mcpServers"]["agent-magnet"] = _build_mcp_entry(
-        user_id, openai_key, storage, redis_url
+        user_id, openai_key, storage, redis_url, team_id
     )
     _write_json(path, config)
     return "MCP server"
@@ -256,6 +260,14 @@ def cmd_init() -> None:
         else:
             storage = "redis"
 
+    team_id = _ask("  Team ID (optional, press Enter to skip, requires Redis): ")
+    if team_id and use_local:
+        print()
+        print("  ⚠  Team memory requires shared storage.")
+        print("     Set MAGNET_REDIS_URL for all team members to use the same Redis instance.")
+        print("     Team ID saved — you can add MAGNET_REDIS_URL later to enable team features.")
+        print()
+
     # 3. Write configs
     print()
     print("  Writing configuration...")
@@ -270,7 +282,7 @@ def cmd_init() -> None:
     for tool_name, path in found.items():
         writer = writers.get(tool_name, _write_mcp_only)
         try:
-            action = writer(path, user_id, openai_key, storage, redis_url)
+            action = writer(path, user_id, openai_key, storage, redis_url, team_id)
             print(f"    ✓ {tool_name} — {action}")
         except Exception as exc:
             print(f"    ✗ {tool_name} — failed: {exc}")

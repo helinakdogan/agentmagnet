@@ -256,6 +256,99 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["user_id", "messages"],
             },
         ),
+        # ── Team memory tools ─────────────────────────────────────────
+        types.Tool(
+            name="get_team_profile",
+            description="Get the shared memory profile for a team (requires Redis)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "Team identifier"},
+                    "project_id": {"type": "string", "description": "Project identifier"},
+                },
+                "required": ["team_id"],
+            },
+        ),
+        types.Tool(
+            name="add_team_signal",
+            description="Record a behavioral signal directly to team-scoped memory (requires Redis)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string"},
+                    "project_id": {"type": "string", "description": "Defaults to MAGNET_PROJECT_ID env var"},
+                    "messages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"role": {"type": "string"}, "content": {"type": "string"}},
+                            "required": ["role", "content"],
+                        },
+                        "description": "Conversation messages",
+                    },
+                    "signal_type": {
+                        "type": "string",
+                        "enum": ["correction", "rejection", "preference_like", "preference_dislike",
+                                 "tone_preference", "watch_out"],
+                    },
+                },
+                "required": ["team_id", "messages", "signal_type"],
+            },
+        ),
+        types.Tool(
+            name="get_merged_injection",
+            description="Get merged memory injection combining user + team + org memory (user scope wins)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string"},
+                    "team_id": {"type": "string", "description": "Optional team identifier"},
+                    "org_id": {"type": "string", "description": "Optional org identifier"},
+                    "project_id": {"type": "string", "description": "Defaults to MAGNET_PROJECT_ID env var"},
+                    "current_message": {"type": "string", "description": "Current user message for episodic retrieval"},
+                },
+                "required": ["user_id"],
+            },
+        ),
+        types.Tool(
+            name="get_project_memory",
+            description="Get a per-user breakdown of what was learned in a project (requires Redis)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_id": {"type": "string", "description": "Project identifier"},
+                    "team_id": {"type": "string", "description": "Optional team identifier to include team-shared memory"},
+                },
+                "required": ["project_id"],
+            },
+        ),
+        types.Tool(
+            name="share_to_team",
+            description="Explicitly share one preference from a user's personal memory to their team (requires Redis)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "User who owns the preference"},
+                    "project_id": {"type": "string", "description": "Defaults to MAGNET_PROJECT_ID env var"},
+                    "fact_or_subject": {"type": "string", "description": "Subject or text of the preference to share"},
+                    "team_id": {"type": "string", "description": "Target team identifier"},
+                },
+                "required": ["user_id", "fact_or_subject", "team_id"],
+            },
+        ),
+        types.Tool(
+            name="forget_team",
+            description="Remove a specific preference from team memory by subject match (requires Redis)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string"},
+                    "project_id": {"type": "string", "description": "Defaults to MAGNET_PROJECT_ID env var"},
+                    "fact_or_subject": {"type": "string", "description": "Subject or text to remove from team memory"},
+                },
+                "required": ["team_id", "fact_or_subject"],
+            },
+        ),
     ]
 
 
@@ -298,6 +391,44 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 project_id,
                 arguments["messages"],
             )
+        elif name == "get_team_profile":
+            result = await _handle_get_team_profile(
+                arguments["team_id"],
+                project_id,
+            )
+        elif name == "add_team_signal":
+            result = await _handle_add_team_signal(
+                arguments["team_id"],
+                project_id,
+                arguments["messages"],
+                arguments["signal_type"],
+            )
+        elif name == "get_merged_injection":
+            result = await _handle_get_merged_injection(
+                arguments["user_id"],
+                arguments.get("team_id"),
+                arguments.get("org_id"),
+                project_id,
+                arguments.get("current_message"),
+            )
+        elif name == "get_project_memory":
+            result = await _handle_get_project_memory(
+                project_id,
+                arguments.get("team_id"),
+            )
+        elif name == "share_to_team":
+            result = await _handle_share_to_team(
+                arguments["user_id"],
+                project_id,
+                arguments["fact_or_subject"],
+                arguments["team_id"],
+            )
+        elif name == "forget_team":
+            result = await _handle_forget_team(
+                arguments["team_id"],
+                project_id,
+                arguments["fact_or_subject"],
+            )
         else:
             result = {"error": f"Unknown tool: {name}"}
     except Exception as e:
@@ -317,7 +448,7 @@ async def _handle_get_profile(user_id: str, project_id: str) -> dict:
 
     from magnet.store import effective_confidence
 
-    prefers, dislikes, expects = [], [], []
+    prefers, dislikes, expects, watch_out = [], [], [], []
     for pref in profile.get("preferences", []):
         if not isinstance(pref, dict):
             continue
@@ -332,6 +463,8 @@ async def _handle_get_profile(user_id: str, project_id: str) -> dict:
             dislikes.append(entry)
         elif relation == "expects":
             expects.append(entry)
+        elif relation == "watch_out":
+            watch_out.append(entry)
 
     reflected_at = profile.get("reflected_at")
     age_days = round((time.time() - reflected_at) / 86400, 1) if reflected_at else None
@@ -342,6 +475,7 @@ async def _handle_get_profile(user_id: str, project_id: str) -> dict:
         "prefers": sorted(prefers, key=lambda x: -x["confidence"]),
         "dislikes": sorted(dislikes, key=lambda x: -x["confidence"]),
         "expects": sorted(expects, key=lambda x: -x["confidence"]),
+        "watch_out": sorted(watch_out, key=lambda x: -x["confidence"]),
         "profile_age_days": age_days,
         "signal_count": profile.get("signal_count", 0),
     }
@@ -417,6 +551,132 @@ async def _handle_add_signal(
 async def _handle_end_session(user_id: str, project_id: str, messages: list[dict]) -> dict:
     memory = _get_memory()
     return await asyncio.to_thread(memory.session_end, user_id, project_id, messages)
+
+
+async def _handle_get_team_profile(team_id: str, project_id: str) -> dict:
+    from magnet.team_store import TeamMemoryRequiresRedis
+    memory = _get_memory()
+    try:
+        profile = await asyncio.to_thread(
+            memory._team_store.load_team_profile, team_id, project_id
+        )
+    except TeamMemoryRequiresRedis as e:
+        return {"error": str(e)}
+    if not profile:
+        return {"team_id": team_id, "project_id": project_id, "prefers": [], "dislikes": [], "expects": [], "watch_out": []}
+
+    buckets: dict[str, list] = {"prefers": [], "dislikes": [], "expects": [], "watch_out": []}
+    for pref in profile.get("preferences", []):
+        if not isinstance(pref, dict):
+            continue
+        relation = pref.get("relation", "")
+        if relation not in buckets:
+            continue
+        buckets[relation].append({
+            "text": pref.get("natural_text", pref.get("subject", "")),
+            "confidence": round(pref.get("confidence", 0.5), 3),
+            "shared_by": pref.get("shared_by"),
+        })
+    return {"team_id": team_id, "project_id": project_id, **buckets}
+
+
+async def _handle_add_team_signal(
+    team_id: str, project_id: str, messages: list[dict], signal_type: str
+) -> dict:
+    from magnet.team_store import TeamMemoryRequiresRedis
+    memory = _get_memory()
+    try:
+        memory._team_store._require_redis()
+    except TeamMemoryRequiresRedis as e:
+        return {"error": str(e)}
+
+    user_msgs = [m for m in messages if m.get("role") == "user"]
+    if not user_msgs:
+        return {"status": "ok", "signal_type": signal_type, "buffered": False}
+
+    last_msg = user_msgs[-1].get("content", "")
+    tenant_id = f"{project_id}:{team_id}"
+
+    instant_types = {"preference_like", "preference_dislike", "tone_preference", "watch_out"}
+    if signal_type in instant_types:
+        existing = await asyncio.to_thread(memory._team_store.load_team_profile, team_id, project_id) or {}
+        updated = await asyncio.to_thread(
+            memory._reflector.instant_learn,
+            tenant_id,
+            signal_type,
+            last_msg[:200],
+            0.75,
+            existing,
+        )
+        await asyncio.to_thread(memory._team_store.save_team_profile, team_id, project_id, updated)
+        return {"status": "ok", "signal_type": signal_type, "team_id": team_id, "instant_learned": True}
+
+    signal = {"type": signal_type, "message": last_msg[:200], "confidence": 0.6}
+    count = await asyncio.to_thread(memory._buffer.push, tenant_id, [signal])
+    reflected = False
+    if await asyncio.to_thread(memory._buffer.should_reflect, tenant_id):
+        signals_to_reflect = await asyncio.to_thread(memory._buffer.flush, tenant_id)
+        if signals_to_reflect:
+            existing = await asyncio.to_thread(memory._team_store.load_team_profile, team_id, project_id) or {}
+            profile = await asyncio.to_thread(
+                memory._reflector.reflect, tenant_id, signals_to_reflect, existing
+            )
+            await asyncio.to_thread(memory._team_store.save_team_profile, team_id, project_id, profile)
+            reflected = True
+
+    return {"status": "ok", "signal_type": signal_type, "team_id": team_id,
+            "buffer_count": count, "reflected": reflected}
+
+
+async def _handle_get_merged_injection(
+    user_id: str,
+    team_id: str | None,
+    org_id: str | None,
+    project_id: str,
+    current_message: str | None,
+) -> dict:
+    memory = _get_memory()
+    current_msgs = [{"role": "user", "content": current_message}] if current_message else None
+    injection = await asyncio.to_thread(
+        memory.get_injection_with_team, user_id, project_id, team_id, org_id, current_msgs
+    )
+    return {"injection": injection, "has_profile": bool(injection), "team_id": team_id, "org_id": org_id}
+
+
+async def _handle_get_project_memory(project_id: str, team_id: str | None) -> dict:
+    from magnet.team_store import TeamMemoryRequiresRedis
+    memory = _get_memory()
+    try:
+        result = await asyncio.to_thread(memory.get_project_memory, project_id, team_id)
+    except TeamMemoryRequiresRedis as e:
+        return {"error": str(e)}
+    return result
+
+
+async def _handle_share_to_team(
+    user_id: str, project_id: str, fact_or_subject: str, team_id: str
+) -> dict:
+    from magnet.team_store import TeamMemoryRequiresRedis
+    memory = _get_memory()
+    try:
+        result = await asyncio.to_thread(
+            memory.share_to_team, user_id, project_id, fact_or_subject, team_id
+        )
+    except TeamMemoryRequiresRedis as e:
+        return {"error": str(e)}
+    return result
+
+
+async def _handle_forget_team(team_id: str, project_id: str, fact_or_subject: str) -> dict:
+    from magnet.team_store import TeamMemoryRequiresRedis
+    memory = _get_memory()
+    try:
+        result = await asyncio.to_thread(
+            memory._team_store.forget_team, team_id, project_id, fact_or_subject
+        )
+    except TeamMemoryRequiresRedis as e:
+        return {"error": str(e)}
+    return result
 
 
 async def _handle_get_cold_start(project_id: str, context: str | None) -> dict:

@@ -33,6 +33,7 @@ from .episodic_store import EpisodicStore
 from .knowledge_store import KnowledgeStore
 from .memory_orchestrator import MemoryOrchestrator
 from .consolidation import ConsolidationEngine
+from .team_store import TeamStore, TeamMemoryRequiresRedis, REDIS_REQUIRED_MSG
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +181,9 @@ class BehavioralMemory:
             profile_store=self._store,
             aggregate_store=self._aggregate,
         )
+
+        # ── Team memory (Redis required for shared scopes) ────────────
+        self._team_store = TeamStore(redis_client=redis_client)
 
     def _resolve_user_id(self, user_id: str | None) -> str:
         resolved = user_id or self._default_user_id
@@ -728,6 +732,98 @@ class BehavioralMemory:
                 f"Reflect error ({tenant_id}): {e}. {len(signals)} signals may be lost.",
                 exc_info=True,
             )
+
+    # ── Team memory public API ────────────────────────────────────────
+
+    def get_injection_with_team(
+        self,
+        user_id: str | None = None,
+        project_id: str = "default",
+        team_id: str | None = None,
+        org_id: str | None = None,
+        current_messages: list[dict] | None = None,
+    ) -> str:
+        """
+        Build a merged memory injection: user preferences take precedence
+        over team, team over org.
+
+        Falls back to personal-only injection if team/org Redis is unavailable.
+        """
+        user_id = self._resolve_user_id(user_id)
+        tenant_id = f"{project_id}:{user_id}"
+        user_profile = self._store.load(tenant_id)
+
+        if not team_id and not org_id:
+            return self.get_injection(user_id, project_id, current_messages)
+
+        try:
+            return self._team_store.build_merged_injection(
+                user_profile=user_profile,
+                team_id=team_id,
+                org_id=org_id,
+                project_id=project_id,
+                reflector=self._reflector,
+            )
+        except TeamMemoryRequiresRedis as e:
+            logger.warning(f"get_injection_with_team: {e}")
+            return self.get_injection(user_id, project_id, current_messages)
+
+    def get_project_memory(
+        self,
+        project_id: str,
+        team_id: str | None = None,
+    ) -> dict:
+        """
+        Return a per-user breakdown of preferences learned within project_id.
+        Requires Redis.
+        """
+        try:
+            return self._team_store.get_project_memory(project_id, team_id)
+        except TeamMemoryRequiresRedis:
+            return {
+                "error": REDIS_REQUIRED_MSG,
+                "project_id": project_id,
+                "contributors": {},
+            }
+
+    def share_to_team(
+        self,
+        user_id: str | None = None,
+        project_id: str = "default",
+        fact_or_subject: str = "",
+        team_id: str = "",
+    ) -> dict:
+        """
+        Explicitly copy one preference from the user's personal profile to team memory.
+        """
+        user_id = self._resolve_user_id(user_id)
+        tenant_id = f"{project_id}:{user_id}"
+        personal_profile = self._store.load(tenant_id)
+        try:
+            return self._team_store.share_to_team(
+                user_id=user_id,
+                project_id=project_id,
+                fact_or_subject=fact_or_subject,
+                team_id=team_id,
+                personal_profile=personal_profile,
+            )
+        except TeamMemoryRequiresRedis:
+            return {"error": REDIS_REQUIRED_MSG}
+
+    def promote_to_team(
+        self,
+        team_id: str,
+        project_id: str = "default",
+        min_users: int = 2,
+    ) -> dict:
+        """
+        Scan all personal profiles in project_id, find preferences shared by
+        min_users+ members, and write them to the team's shared profile.
+        """
+        try:
+            return self._team_store.promote_to_team(team_id, project_id, min_users)
+        except TeamMemoryRequiresRedis:
+            return {"error": REDIS_REQUIRED_MSG}
 
     def _classify_category_local(self, text: str) -> str:
         """
