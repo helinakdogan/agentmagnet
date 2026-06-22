@@ -116,5 +116,24 @@ Three memory layers:
 - **Episodic** (Qdrant) — semantic recall when relevant
 - **Knowledge** (Neo4j) — long-term entity relationships
 
+## Free vs Premium
+
+Agent Magnet is fully usable without an account. The free tier is not a demo — it's the real thing.
+
+**Free (no account needed)**
+- Local SQLite memory — no Redis, no external services
+- Single-user behavioral memory (preferences, corrections, forgetting)
+- Cross-tool identity — same memory across Claude Code, Cursor, any MCP client
+- Context compression (`compress_context`, `retrieve_original`)
+- Bring your own OpenAI key (BYOK)
+
+**Premium (API key from agentmagnet.app)**
+- Team memory — share learned preferences across a team with a shared Redis
+- Hosted storage — Magnet-managed Redis, no infra to run
+- Compression analytics (`compression_stats`)
+- Priority support
+
+To enable premium features, set `MAGNET_API_KEY=mg_sk_...` in your environment or pass it during `agent-magnet init`.
+
 ## License
 MIT

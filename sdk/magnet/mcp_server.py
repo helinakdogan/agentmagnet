@@ -32,6 +32,7 @@ from mcp.server.stdio import stdio_server
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PROJECT_ID = os.environ.get("MAGNET_PROJECT_ID", "default")
+_DEFAULT_USER_ID = os.environ.get("MAGNET_USER_ID", "default_user")
 
 # ── Lazy-init singleton ───────────────────────────────────────────────────────
 
@@ -43,12 +44,16 @@ def _get_memory() -> Any:
     if _memory is not None:
         return _memory
 
-    redis_url = os.environ.get("MAGNET_REDIS_URL")
+    redis_url  = os.environ.get("MAGNET_REDIS_URL")
     local_mode = os.environ.get("MAGNET_LOCAL_MODE", "").lower() in ("1", "true", "yes")
     openai_key = os.environ.get("MAGNET_OPENAI_KEY") or os.environ.get("OPENAI_API_KEY")
     qdrant_url = os.environ.get("MAGNET_QDRANT_URL") or os.environ.get("QDRANT_URL")
     qdrant_api_key = os.environ.get("MAGNET_QDRANT_API_KEY") or os.environ.get("QDRANT_API_KEY")
-    # Neo4j is read directly from NEO4J_URL / NEO4J_AUTH inside BehavioralMemory
+
+    from magnet.tier import get_tier, resolve_storage_mode
+    tier         = get_tier()
+    storage_mode = resolve_storage_mode()
+    logger.info(f"[magnet] tier={tier}  storage={storage_mode}  user={_DEFAULT_USER_ID}")
 
     redis_client = None
     if redis_url:
@@ -56,13 +61,14 @@ def _get_memory() -> Any:
             import redis as redis_lib
             redis_client = redis_lib.from_url(redis_url, decode_responses=True)
             redis_client.ping()
+            logger.info("[magnet] Redis connected")
         except Exception as e:
-            logger.warning(f"Redis unavailable ({e}); running in-memory only")
+            logger.warning(f"[magnet] Redis unavailable ({e}); falling back to in-memory only")
             redis_client = None
     elif local_mode:
         from magnet.local_store import SQLiteBackend
         redis_client = SQLiteBackend()
-        logger.info("Local mode: using SQLite storage at ~/.agent-magnet/memory.db")
+        logger.info("[magnet] Local mode: SQLite at ~/.agent-magnet/memory.db")
 
     from magnet.client import BehavioralMemory
 
@@ -349,6 +355,47 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["team_id", "fact_or_subject"],
             },
         ),
+        # ── Compression tools (free tier) ─────────────────────────────
+        types.Tool(
+            name="compress_context",
+            description=(
+                "Compress a large block of text (logs, JSON arrays, long documents) "
+                "to reduce token usage. Original is cached locally for full retrieval. "
+                "Returns compressed text + cache_key + token savings."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Text to compress"},
+                    "content_type": {
+                        "type": "string",
+                        "enum": ["json_array", "log", "long_text", "whitespace"],
+                        "description": "Optional content type hint (auto-detected if omitted)",
+                    },
+                },
+                "required": ["text"],
+            },
+        ),
+        types.Tool(
+            name="retrieve_original",
+            description="Retrieve the original (uncompressed) text by cache key returned from compress_context",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "cache_key": {"type": "string", "description": "The cache_key from compress_context metadata"},
+                },
+                "required": ["cache_key"],
+            },
+        ),
+        types.Tool(
+            name="compression_stats",
+            description="Get aggregated compression statistics across all sessions (premium feature)",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -356,20 +403,21 @@ async def list_tools() -> list[types.Tool]:
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     try:
         project_id = arguments.get("project_id") or _DEFAULT_PROJECT_ID
+        user_id = arguments.get("user_id") or _DEFAULT_USER_ID
         if name == "get_profile":
             result = await _handle_get_profile(
-                arguments["user_id"],
+                user_id,
                 project_id,
             )
         elif name == "inject_memory":
             result = await _handle_inject_memory(
-                arguments["user_id"],
+                user_id,
                 project_id,
                 arguments.get("current_message"),
             )
         elif name == "add_signal":
             result = await _handle_add_signal(
-                arguments["user_id"],
+                user_id,
                 project_id,
                 arguments["messages"],
                 arguments["signal_type"],
@@ -381,13 +429,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
         elif name == "end_session":
             result = await _handle_end_session(
-                arguments["user_id"],
+                user_id,
                 project_id,
                 arguments["messages"],
             )
         elif name == "save_session":
             result = await _handle_end_session(
-                arguments["user_id"],
+                user_id,
                 project_id,
                 arguments["messages"],
             )
@@ -405,7 +453,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
         elif name == "get_merged_injection":
             result = await _handle_get_merged_injection(
-                arguments["user_id"],
+                user_id,
                 arguments.get("team_id"),
                 arguments.get("org_id"),
                 project_id,
@@ -418,7 +466,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
         elif name == "share_to_team":
             result = await _handle_share_to_team(
-                arguments["user_id"],
+                user_id,
                 project_id,
                 arguments["fact_or_subject"],
                 arguments["team_id"],
@@ -429,6 +477,15 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 project_id,
                 arguments["fact_or_subject"],
             )
+        elif name == "compress_context":
+            result = await _handle_compress_context(
+                arguments["text"],
+                arguments.get("content_type"),
+            )
+        elif name == "retrieve_original":
+            result = await _handle_retrieve_original(arguments["cache_key"])
+        elif name == "compression_stats":
+            result = await _handle_compression_stats()
         else:
             result = {"error": f"Unknown tool: {name}"}
     except Exception as e:
@@ -554,6 +611,9 @@ async def _handle_end_session(user_id: str, project_id: str, messages: list[dict
 
 
 async def _handle_get_team_profile(team_id: str, project_id: str) -> dict:
+    from magnet.tier import check_premium_feature, premium_required_response
+    if not check_premium_feature("team_memory"):
+        return premium_required_response()
     from magnet.team_store import TeamMemoryRequiresRedis
     memory = _get_memory()
     try:
@@ -583,6 +643,9 @@ async def _handle_get_team_profile(team_id: str, project_id: str) -> dict:
 async def _handle_add_team_signal(
     team_id: str, project_id: str, messages: list[dict], signal_type: str
 ) -> dict:
+    from magnet.tier import check_premium_feature, premium_required_response
+    if not check_premium_feature("team_memory"):
+        return premium_required_response()
     from magnet.team_store import TeamMemoryRequiresRedis
     memory = _get_memory()
     try:
@@ -635,6 +698,9 @@ async def _handle_get_merged_injection(
     project_id: str,
     current_message: str | None,
 ) -> dict:
+    from magnet.tier import check_premium_feature, premium_required_response
+    if (team_id or org_id) and not check_premium_feature("team_memory"):
+        return premium_required_response()
     memory = _get_memory()
     current_msgs = [{"role": "user", "content": current_message}] if current_message else None
     injection = await asyncio.to_thread(
@@ -644,6 +710,9 @@ async def _handle_get_merged_injection(
 
 
 async def _handle_get_project_memory(project_id: str, team_id: str | None) -> dict:
+    from magnet.tier import check_premium_feature, premium_required_response
+    if not check_premium_feature("team_memory"):
+        return premium_required_response()
     from magnet.team_store import TeamMemoryRequiresRedis
     memory = _get_memory()
     try:
@@ -656,6 +725,9 @@ async def _handle_get_project_memory(project_id: str, team_id: str | None) -> di
 async def _handle_share_to_team(
     user_id: str, project_id: str, fact_or_subject: str, team_id: str
 ) -> dict:
+    from magnet.tier import check_premium_feature, premium_required_response
+    if not check_premium_feature("team_memory"):
+        return premium_required_response()
     from magnet.team_store import TeamMemoryRequiresRedis
     memory = _get_memory()
     try:
@@ -668,6 +740,9 @@ async def _handle_share_to_team(
 
 
 async def _handle_forget_team(team_id: str, project_id: str, fact_or_subject: str) -> dict:
+    from magnet.tier import check_premium_feature, premium_required_response
+    if not check_premium_feature("team_memory"):
+        return premium_required_response()
     from magnet.team_store import TeamMemoryRequiresRedis
     memory = _get_memory()
     try:
@@ -677,6 +752,49 @@ async def _handle_forget_team(team_id: str, project_id: str, fact_or_subject: st
     except TeamMemoryRequiresRedis as e:
         return {"error": str(e)}
     return result
+
+
+# ── Compression handlers ───────────────────────────────────────────────────────
+
+_compressor: Any = None
+
+
+def _get_compressor() -> Any:
+    global _compressor
+    if _compressor is None:
+        from magnet.compress import Compressor
+        _compressor = Compressor()
+    return _compressor
+
+
+async def _handle_compress_context(text: str, content_type: str | None) -> dict:
+    comp = _get_compressor()
+    compressed, meta = await asyncio.to_thread(comp.compress, text, content_type)
+    return {
+        "compressed_text": compressed,
+        "cache_key": meta.get("cache_key"),
+        "strategy": meta.get("strategy"),
+        "original_tokens": meta.get("original_tokens"),
+        "compressed_tokens": meta.get("compressed_tokens"),
+        "saved_tokens": meta.get("saved_tokens", 0),
+        "is_compressed": meta.get("strategy") != "none",
+    }
+
+
+async def _handle_retrieve_original(cache_key: str) -> dict:
+    comp = _get_compressor()
+    original = await asyncio.to_thread(comp.retrieve_by_key, cache_key)
+    if original is None:
+        return {"error": f"No cached original found for key '{cache_key}'"}
+    return {"original_text": original, "cache_key": cache_key}
+
+
+async def _handle_compression_stats() -> dict:
+    from magnet.tier import check_premium_feature, premium_required_response
+    if not check_premium_feature("compression_stats"):
+        return premium_required_response()
+    comp = _get_compressor()
+    return await asyncio.to_thread(comp.stats)
 
 
 async def _handle_get_cold_start(project_id: str, context: str | None) -> dict:

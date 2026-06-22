@@ -21,6 +21,36 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 logger = logging.getLogger(__name__)
 
+_COMPRESS_ENABLED = os.getenv("MAGNET_COMPRESS", "").lower() in ("1", "true", "yes")
+_COMPRESS_MIN_CHARS = 2000  # ~500 tokens before we bother compressing
+
+if _COMPRESS_ENABLED:
+    from magnet.compress import Compressor as _Compressor
+    _compressor = _Compressor()
+    logger.info("[proxy] Context compression enabled (MAGNET_COMPRESS=1)")
+else:
+    _compressor = None
+
+
+def _compress_messages(messages: list[dict]) -> tuple[list[dict], int]:
+    """Compress large message contents before forwarding to the LLM. Returns (messages, total_saved_tokens)."""
+    if not _compressor:
+        return messages, 0
+    result = []
+    total_saved = 0
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str) and len(content) >= _COMPRESS_MIN_CHARS:
+            compressed, meta = _compressor.compress(content)
+            saved = meta.get("saved_tokens", 0)
+            if saved > 0:
+                total_saved += saved
+                msg = {**msg, "content": compressed}
+        result.append(msg)
+    if total_saved > 0:
+        logger.info(f"[proxy] Compressed prompt: saved {total_saved:,} tokens")
+    return result, total_saved
+
 app = FastAPI(title="Magnet Proxy", version="2.0")
 
 # CORS middleware
@@ -220,6 +250,11 @@ async def chat_completions(
         ).hexdigest()[:32]
 
     messages = body.get("messages", [])
+
+    # Compress large message contents before forwarding (opt-in via MAGNET_COMPRESS=1)
+    messages, _tokens_saved = _compress_messages(messages)
+    if _tokens_saved:
+        body["messages"] = messages
 
     ab_group = get_ab_group(x_session_id)
 
