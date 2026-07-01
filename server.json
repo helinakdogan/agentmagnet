@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "io.github.helinakdogan/agent-magnet",
   "description": "Behavioral memory layer for AI tools. Learns preferences and context across Claude, Cursor, Codex.",
-  "version": "0.1.14",
+  "version": "0.1.17",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "agent-magnet",
-      "version": "0.1.14",
+      "version": "0.1.17",
       "command": "agent-magnet-mcp",
       "transport": {
         "type": "stdio"
@@ -36,6 +36,11 @@
         {
           "name": "MAGNET_PROJECT_ID",
           "description": "Namespace for memory isolation across projects (defaults to 'default')",
+          "isRequired": false
+        },
+        {
+          "name": "MAGNET_PROFILE",
+          "description": "Active persona/profile context — keeps separate memory spaces (e.g. 'company' vs 'hobby'). Defaults to 'default'.",
           "isRequired": false
         }
       ]

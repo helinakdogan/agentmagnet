@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-magnet"
-version = "0.1.14"
+version = "0.1.21"
 description = "Self-learning memory infrastructure for AI products"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,7 @@ dependencies = [
     "qdrant-client",
     "neo4j",
     "python-dotenv",
+    "sentence-transformers>=2.2",
 ]
 
 [project.urls]
