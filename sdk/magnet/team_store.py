@@ -553,6 +553,24 @@ class MagnetTeamStore:
         except Exception:
             return False
 
+    def list_shared_projects(self, team_id: str) -> list[dict]:
+        """
+        Return every project shared with the team, so a member can discover
+        them even if their own local active project points somewhere else.
+
+        Each entry: {"project": name, "item_count": int, "shared_by": [contributors]}.
+        """
+        self._require_redis()
+        raw = self._redis.get(self._projects_key(team_id))
+        projects: list = json.loads(raw) if raw else []
+
+        result: list[dict] = []
+        for project in projects:
+            items = self.load_team_items(team_id, project)
+            sharers = sorted({it.get("shared_by") for it in items if it.get("shared_by")})
+            result.append({"project": project, "item_count": len(items), "shared_by": sharers})
+        return result
+
     # ── Shared project memory ──────────────────────────────────────────
 
     def load_team_items(self, team_id: str, project: str) -> list[dict]:

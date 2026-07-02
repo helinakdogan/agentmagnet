@@ -478,6 +478,22 @@ async def list_tools() -> list[types.Tool]:
                 "required": [],
             },
         ),
+        # ── TEAM: list_team_projects ──────────────────────────────────────────
+        types.Tool(
+            name="list_team_projects",
+            description=(
+                "List projects that have been shared with the team, so a member can "
+                "discover and pick one even if their own local active project is "
+                "something else entirely. Triggered by '*team projects'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "Defaults to MAGNET_TEAM_ID env var"},
+                },
+                "required": [],
+            },
+        ),
         # ── TEAM: share_project_to_team ───────────────────────────────────────
         types.Tool(
             name="share_project_to_team",
@@ -521,7 +537,11 @@ async def list_tools() -> list[types.Tool]:
             name="get_team_memory",
             description=(
                 "Show the team's shared memory for a project (items shared by all members). "
-                "Shows who shared each item and which were auto-promoted."
+                "Shows who shared each item and which were auto-promoted. "
+                "If no project is given and the caller's local active project has no team data, "
+                "this auto-selects the team's one shared project, or lists them to choose from "
+                "if there are several — it never silently returns empty just because the local "
+                "active project points somewhere unrelated."
             ),
             inputSchema={
                 "type": "object",
@@ -947,6 +967,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
         elif name == "list_team_members":
             result = await _handle_list_team_members(team_id=arguments.get("team_id"))
+        elif name == "list_team_projects":
+            result = await _handle_list_team_projects(team_id=arguments.get("team_id"))
         elif name == "share_project_to_team":
             result = await _handle_share_project_to_team(
                 team_id=arguments.get("team_id"),
@@ -1320,6 +1342,34 @@ async def _handle_list_team_members(team_id: str | None = None) -> str:
     return "\n".join(lines)
 
 
+def _format_shared_projects_menu(team_id: str, shared_projects: list[dict]) -> str:
+    lines = [f"Projects shared in team {team_id}:"]
+    for i, p in enumerate(shared_projects, 1):
+        who = ", ".join(p["shared_by"]) if p["shared_by"] else "?"
+        count = p["item_count"]
+        lines.append(f"  {i}. {p['project']}  ({count} item{'s' if count != 1 else ''}, shared by {who})")
+    lines.append("")
+    lines.append("Which one? (number or name)")
+    return "\n".join(lines)
+
+
+async def _handle_list_team_projects(team_id: str | None = None) -> str:
+    tid = team_id or _DEFAULT_TEAM_ID
+    if not tid:
+        return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
+    err = _require_redis_for_team()
+    if err:
+        return err
+    ts = _get_team_store()
+    try:
+        shared_projects = await asyncio.to_thread(ts.list_shared_projects, tid)
+    except Exception as e:
+        return f"Could not load team projects: {e}"
+    if not shared_projects:
+        return f"No projects shared yet in team {tid}. Use *team share to share the active project."
+    return _format_shared_projects_menu(tid, shared_projects)
+
+
 async def _handle_share_project_to_team(
     team_id: str | None = None,
     profile: str | None = None,
@@ -1387,10 +1437,35 @@ async def _handle_get_team_memory(
     err = _require_redis_for_team()
     if err:
         return err
-    _, _, project = _resolve_context(None, project)
+
     ts = _get_team_store()
+    explicit_project = project is not None
+    _, profile, resolved_project = _resolve_context(None, project)
+
+    if not explicit_project:
+        # Local active project may point somewhere the team never shared —
+        # don't silently return empty, find the right shared project instead.
+        try:
+            is_shared = await asyncio.to_thread(ts.is_project_shared, tid, resolved_project)
+        except Exception as e:
+            return f"Could not check shared projects: {e}"
+
+        if not is_shared:
+            try:
+                shared_projects = await asyncio.to_thread(ts.list_shared_projects, tid)
+            except Exception as e:
+                return f"Could not load team projects: {e}"
+
+            if len(shared_projects) == 1:
+                resolved_project = shared_projects[0]["project"]
+                _write_active_context(profile, resolved_project)
+            elif len(shared_projects) > 1:
+                return _format_shared_projects_menu(tid, shared_projects)
+            else:
+                return f"No projects shared yet in team {tid}. Use *team share to share the active project."
+
     try:
-        return await asyncio.to_thread(ts.format_team_display, tid, project)
+        return await asyncio.to_thread(ts.format_team_display, tid, resolved_project)
     except Exception as e:
         return f"Could not load team memory: {e}"
 
