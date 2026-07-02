@@ -7,7 +7,7 @@ from .episodic_store import EpisodicStore
 from .knowledge_store import KnowledgeStore
 from .memory_orchestrator import MemoryOrchestrator
 
-__version__ = "0.1.21"
+__version__ = "0.1.24"
 __all__ = [
     "BehavioralMemory",
     "SignalDetector",

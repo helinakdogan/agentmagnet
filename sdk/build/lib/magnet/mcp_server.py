@@ -16,7 +16,11 @@ Active context (which profile + project to read/write) is stored in
 Primary tools:
   recall               — load active project memory at session start
   remember             — save a decision/preference/etc to the active project
-  show_project_memory  — display organized memory for the active project
+  show_project_memory  — display organized memory for the active project (with item IDs)
+  forget_memory        — delete a memory item by id or text query (*forget trigger)
+  mark_done            — mark a goal as completed instead of deleting it
+  recap                — synthesized natural-language catch-up (*recap trigger)
+  show_all_memory      — full dump of active project or bird's-eye across all (*memory trigger)
   list_profiles        — TV menu: pick a profile (*profiles trigger)
   list_projects        — TV menu: pick a project (*projects trigger)
   set_active_context   — set the active profile + project
@@ -47,6 +51,7 @@ from mcp.server.stdio import stdio_server
 logger = logging.getLogger(__name__)
 
 _DEFAULT_USER_ID = os.environ.get("MAGNET_USER_ID", "user")
+_DEFAULT_TEAM_ID = os.environ.get("MAGNET_TEAM_ID", "")
 _ACTIVE_FILE = Path.home() / ".agent-magnet" / "active.json"
 
 # ── Active context ────────────────────────────────────────────────────────────
@@ -145,6 +150,7 @@ _memory: Any = None
 _memory_store: Any = None
 _usage_counter: Any = None
 _compressor: Any = None
+_team_store: Any = None
 
 
 def _get_backend() -> Any:
@@ -215,6 +221,28 @@ def _get_compressor() -> Any:
         from magnet.compress import Compressor
         _compressor = Compressor()
     return _compressor
+
+
+def _get_team_store() -> Any:
+    """MagnetTeamStore — category-based team memory. Requires Redis."""
+    global _team_store
+    if _team_store is None:
+        from magnet.team_store import MagnetTeamStore
+        _team_store = MagnetTeamStore(redis_client=_get_backend())
+    return _team_store
+
+
+async def _load_team_items_if_shared(project: str, team_id: str) -> list[dict]:
+    """Load team items for project if it's shared; returns [] if not shared or no Redis."""
+    if not team_id:
+        return []
+    try:
+        ts = _get_team_store()
+        if await asyncio.to_thread(ts.is_project_shared, team_id, project):
+            return await asyncio.to_thread(ts.load_team_items, team_id, project)
+    except Exception as e:
+        logger.debug(f"[team] load_team_items failed: {e}")
+    return []
 
 
 # ── Signal type → storage category ───────────────────────────────────────────
@@ -320,6 +348,231 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "profile": {"type": "string", "description": "Defaults to active profile"},
+                    "project": {"type": "string", "description": "Defaults to active project"},
+                },
+                "required": [],
+            },
+        ),
+        # ── PRIMARY: forget_memory (*forget) ─────────────────────────────────
+        types.Tool(
+            name="forget_memory",
+            description=(
+                "Remove a memory item. Triggered when the user types '*forget <something>' "
+                "or says 'delete', 'remove', 'forget' about a specific memory.\n"
+                "Two modes:\n"
+                "  1. item_id provided → delete immediately (id shown in brackets in show_project_memory).\n"
+                "  2. query provided, no item_id → find best match and return a preview; "
+                "     show it to the user and ask for confirmation, then call again with item_id to delete.\n"
+                "Return a clear confirmation: \"Forgot: '<text>' from <category>.\""
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "string",
+                        "description": "6-char id shown in brackets, e.g. 'a1b2c3' — deletes directly",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Text to search for — returns best match preview; call again with item_id to confirm",
+                    },
+                    "profile": {"type": "string", "description": "Defaults to active profile"},
+                    "project": {"type": "string", "description": "Defaults to active project"},
+                },
+                "required": [],
+            },
+        ),
+        # ── PRIMARY: mark_done ────────────────────────────────────────────────
+        types.Tool(
+            name="mark_done",
+            description=(
+                "Mark a goal as completed (status → done) instead of deleting it. "
+                "Call when the user says a goal is finished/done/completed.\n"
+                "Two modes:\n"
+                "  1. item_id provided → mark done immediately.\n"
+                "  2. query provided → find best matching goal and return preview; "
+                "     confirm with user, then call again with item_id.\n"
+                "Done goals are hidden from recall/inject but still visible in show_project_memory."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "string",
+                        "description": "Goal item id to mark done",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Text to find the goal — returns match preview, call again with item_id to confirm",
+                    },
+                    "profile": {"type": "string", "description": "Defaults to active profile"},
+                    "project": {"type": "string", "description": "Defaults to active project"},
+                },
+                "required": [],
+            },
+        ),
+        # ── TEAM: create_team ─────────────────────────────────────────────────
+        types.Tool(
+            name="create_team",
+            description=(
+                "Create a new team and become its owner. "
+                "Triggered by '*team new <name>'. "
+                "REQUIRES shared Redis (MAGNET_REDIS_URL must be set). "
+                "Returns a team_id (e.g. 'team-a1b2c3') to share with teammates. "
+                "Teammates join with join_team(team_id)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_name": {"type": "string", "description": "Name for the team (e.g. 'backend-crew')"},
+                },
+                "required": ["team_name"],
+            },
+        ),
+        # ── TEAM: join_team ───────────────────────────────────────────────────
+        types.Tool(
+            name="join_team",
+            description=(
+                "Join an existing team by id. "
+                "Triggered by '*team join <team_id>'. "
+                "REQUIRES shared Redis. The team_id is given by the team owner."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "Team id to join (e.g. 'team-a1b2c3')"},
+                },
+                "required": ["team_id"],
+            },
+        ),
+        # ── TEAM: add_team_member ─────────────────────────────────────────────
+        types.Tool(
+            name="add_team_member",
+            description=(
+                "Owner adds a user directly to the team (owner-only). "
+                "The added user must also set MAGNET_TEAM_ID in their MCP config. "
+                "Alternative: share your team_id so they can run join_team themselves."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "Team id"},
+                    "user_id": {"type": "string", "description": "User id of the person to add"},
+                },
+                "required": ["team_id", "user_id"],
+            },
+        ),
+        # ── TEAM: list_team_members ───────────────────────────────────────────
+        types.Tool(
+            name="list_team_members",
+            description=(
+                "Show all members of a team. "
+                "Triggered by '*team members'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "Defaults to MAGNET_TEAM_ID env var"},
+                },
+                "required": [],
+            },
+        ),
+        # ── TEAM: share_project_to_team ───────────────────────────────────────
+        types.Tool(
+            name="share_project_to_team",
+            description=(
+                "Copy the active project's memory into the team's shared space. "
+                "After this, all team members who recall or work in this project "
+                "will see the shared items labeled [team]. "
+                "Triggered by '*team share'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
+                    "profile": {"type": "string", "description": "Defaults to active profile"},
+                    "project": {"type": "string", "description": "Defaults to active project"},
+                },
+                "required": [],
+            },
+        ),
+        # ── TEAM: share_item_to_team ──────────────────────────────────────────
+        types.Tool(
+            name="share_item_to_team",
+            description=(
+                "Share one specific memory item to the team by its item id. "
+                "Triggered by '*share <item_id>'. "
+                "Use show_project_memory to see item ids."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string", "description": "The 6-char item id to share"},
+                    "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
+                    "profile": {"type": "string", "description": "Defaults to active profile"},
+                    "project": {"type": "string", "description": "Defaults to active project"},
+                },
+                "required": ["item_id"],
+            },
+        ),
+        # ── TEAM: get_team_memory ─────────────────────────────────────────────
+        types.Tool(
+            name="get_team_memory",
+            description=(
+                "Show the team's shared memory for a project (items shared by all members). "
+                "Shows who shared each item and which were auto-promoted."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
+                    "project": {"type": "string", "description": "Defaults to active project"},
+                },
+                "required": [],
+            },
+        ),
+        # ── PRIMARY: recap (*recap) ───────────────────────────────────────────
+        types.Tool(
+            name="recap",
+            description=(
+                "SYNTHESIZED CATCH-UP — call when the user asks 'where were we', "
+                "'what were we doing', 'catch me up', 'remind me where we left off', "
+                "or types '*recap'. "
+                "Pulls all memory for the active project and returns a natural prose summary — "
+                "like a helpful teammate catching you up: what we were building, key decisions, "
+                "things to watch out for, and what's still open. "
+                "NEVER return a raw category list — deliver this as a human narrative."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "profile": {"type": "string", "description": "Defaults to active profile"},
+                    "project": {"type": "string", "description": "Defaults to active project"},
+                },
+                "required": [],
+            },
+        ),
+        # ── PRIMARY: show_all_memory (*memory) ───────────────────────────────
+        types.Tool(
+            name="show_all_memory",
+            description=(
+                "FULL MEMORY DUMP — call when the user types '*memory' or says "
+                "'what's saved', 'show everything', 'what do you have stored in agent magnet'.\n"
+                "Two modes:\n"
+                "  DEFAULT (*memory): full dump of the ACTIVE project — every category, "
+                "every item with its id, clean readable text (not JSON).\n"
+                "  ALL (*memory all): bird's-eye view across ALL profiles and projects — "
+                "shows item counts per category so the user sees the whole memory landscape.\n"
+                "Pass show_all=true for the all-projects overview."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "show_all": {
+                        "type": "boolean",
+                        "description": "True for cross-project overview, False (default) for active project full dump",
+                    },
                     "profile": {"type": "string", "description": "Defaults to active profile"},
                     "project": {"type": "string", "description": "Defaults to active project"},
                 },
@@ -669,6 +922,60 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 profile=arguments.get("profile"),
                 project=arguments.get("project"),
             )
+        elif name == "forget_memory":
+            result = await _handle_forget_memory(
+                item_id=arguments.get("item_id"),
+                query=arguments.get("query"),
+                profile=arguments.get("profile"),
+                project=arguments.get("project"),
+            )
+        elif name == "mark_done":
+            result = await _handle_mark_done(
+                item_id=arguments.get("item_id"),
+                query=arguments.get("query"),
+                profile=arguments.get("profile"),
+                project=arguments.get("project"),
+            )
+        elif name == "create_team":
+            result = await _handle_create_team(team_name=arguments["team_name"])
+        elif name == "join_team":
+            result = await _handle_join_team(team_id=arguments["team_id"])
+        elif name == "add_team_member":
+            result = await _handle_add_team_member(
+                team_id=arguments["team_id"],
+                user_id=arguments["user_id"],
+            )
+        elif name == "list_team_members":
+            result = await _handle_list_team_members(team_id=arguments.get("team_id"))
+        elif name == "share_project_to_team":
+            result = await _handle_share_project_to_team(
+                team_id=arguments.get("team_id"),
+                profile=arguments.get("profile"),
+                project=arguments.get("project"),
+            )
+        elif name == "share_item_to_team":
+            result = await _handle_share_item_to_team(
+                item_id=arguments["item_id"],
+                team_id=arguments.get("team_id"),
+                profile=arguments.get("profile"),
+                project=arguments.get("project"),
+            )
+        elif name == "get_team_memory":
+            result = await _handle_get_team_memory(
+                team_id=arguments.get("team_id"),
+                project=arguments.get("project"),
+            )
+        elif name == "recap":
+            result = await _handle_recap(
+                profile=arguments.get("profile"),
+                project=arguments.get("project"),
+            )
+        elif name == "show_all_memory":
+            result = await _handle_show_all_memory(
+                show_all=bool(arguments.get("show_all", False)),
+                profile=arguments.get("profile"),
+                project=arguments.get("project"),
+            )
         elif name == "list_profiles":
             result = await _handle_list_profiles()
         elif name == "list_projects":
@@ -748,21 +1055,33 @@ async def _handle_recall(profile: str | None = None, project: str | None = None)
 
     usage.record_retrieval(project)
 
-    body = await asyncio.to_thread(store.format_for_injection, user, profile, project)
+    team_id = _DEFAULT_TEAM_ID
+    team_items = await _load_team_items_if_shared(project, team_id)
+
+    if team_items:
+        usage.record_team_recall(team_id, project)
+        body = await asyncio.to_thread(
+            store.format_merged_for_injection, user, profile, project, team_items
+        )
+    else:
+        body = await asyncio.to_thread(store.format_for_injection, user, profile, project)
+
     ctx = _ctx_tag(profile, project)
 
     if not body:
+        team_note = f" (shared with team {team_id})" if team_id else ""
         return (
-            f"Fresh start — no memory yet for {profile} / {project}. "
+            f"Fresh start — no memory yet for {profile} / {project}{team_note}. "
             f"I'll remember things as we work together. {ctx}"
         )
 
+    team_note = f"\n[Team context from {team_id} is included — items marked [team].]" if team_items else ""
     lines = [
         f"You're working on {project} in {profile}. Here's what I know:",
         "",
         body,
         "",
-        f"Apply this naturally. The user can override anything. {ctx}",
+        f"Apply this naturally. The user can override anything.{team_note} {ctx}",
     ]
     return "\n".join(lines)
 
@@ -796,14 +1115,451 @@ async def _handle_remember(
 
     ctx = _ctx_tag(profile, project)
     preview = extracted[:80] + ("…" if len(extracted) > 80 else "")
+
+    auto_promoted = False
+    if saved and _DEFAULT_TEAM_ID:
+        # Check if this new item agrees with an existing team item → auto-promote
+        try:
+            ts = _get_team_store()
+            if await asyncio.to_thread(ts.is_project_shared, _DEFAULT_TEAM_ID, project):
+                items = await asyncio.to_thread(store.load, user, profile, project)
+                new_item = items[-1] if items else None
+                if new_item:
+                    auto_promoted = await asyncio.to_thread(
+                        ts.auto_promote_if_agreed, _DEFAULT_TEAM_ID, project, new_item, user
+                    )
+                    if auto_promoted:
+                        usage.record_team_write(_DEFAULT_TEAM_ID, project)
+        except Exception as e:
+            logger.debug(f"[team] auto-promote check failed: {e}")
+
     if saved:
-        return f"Saved [{category}]: \"{preview}\" {ctx}"
+        team_note = " — also auto-promoted to team memory ✓" if auto_promoted else ""
+        return f"Saved [{category}]: \"{preview}\"{team_note} {ctx}"
     return f"Already known (skipped duplicate): \"{preview[:60]}\" {ctx}"
 
 
 async def _handle_show_project_memory(profile: str | None = None, project: str | None = None) -> str:
     user, profile, project = _resolve_context(profile, project)
     store = _get_memory_store()
+    team_items = await _load_team_items_if_shared(project, _DEFAULT_TEAM_ID)
+    if team_items:
+        return await asyncio.to_thread(store.format_merged_for_display, user, profile, project, team_items)
+    return await asyncio.to_thread(store.format_for_display, user, profile, project)
+
+
+async def _handle_forget_memory(
+    item_id: str | None = None,
+    query: str | None = None,
+    profile: str | None = None,
+    project: str | None = None,
+) -> str:
+    user, profile, project = _resolve_context(profile, project)
+    store = _get_memory_store()
+    ctx = _ctx_tag(profile, project)
+
+    if item_id:
+        removed = await asyncio.to_thread(store.delete_entry, user, profile, project, item_id)
+        if removed:
+            return f"Forgot: '{removed['text'][:80]}' from {removed['category']}. {ctx}"
+        return f"No item with id '{item_id}' found in {profile} / {project}."
+
+    if query:
+        items = await asyncio.to_thread(store.load, user, profile, project)
+        if not items:
+            return f"No memories in {profile} / {project} to search. {ctx}"
+        from magnet.local_embeddings import rank_by_similarity
+        matches = await asyncio.to_thread(rank_by_similarity, query, items, "text", 3)
+        if not matches:
+            return f"No matching memory found for '{query}'. {ctx}"
+        best = matches[0]
+        best_id = best.get("id", "?")
+        lines = [
+            f"Best match: [{best_id}] ({best['category']}) \"{best['text'][:100]}\"",
+            "",
+            f"Call forget_memory(item_id='{best_id}') to delete it, or say 'cancel'.",
+        ]
+        if len(matches) > 1:
+            lines += ["", "Other close matches:"]
+            for m in matches[1:]:
+                lines.append(f"  [{m.get('id', '?')}] ({m['category']}) \"{m['text'][:80]}\"")
+        return "\n".join(lines)
+
+    return f"Provide item_id or query. Use show_project_memory to see item ids. {ctx}"
+
+
+async def _handle_mark_done(
+    item_id: str | None = None,
+    query: str | None = None,
+    profile: str | None = None,
+    project: str | None = None,
+) -> str:
+    user, profile, project = _resolve_context(profile, project)
+    store = _get_memory_store()
+    ctx = _ctx_tag(profile, project)
+
+    if item_id:
+        updated = await asyncio.to_thread(store.mark_goal_done, user, profile, project, item_id)
+        if updated:
+            return f"Goal marked done: '{updated['text'][:80]}'. {ctx}"
+        return f"No goal with id '{item_id}' found (or it's not a goal). {ctx}"
+
+    if query:
+        items = await asyncio.to_thread(store.load, user, profile, project)
+        goals = [i for i in items if i.get("category") == "goal"]
+        if not goals:
+            return f"No goals in {profile} / {project}. {ctx}"
+        from magnet.local_embeddings import rank_by_similarity
+        matches = await asyncio.to_thread(rank_by_similarity, query, goals, "text", 1)
+        if not matches:
+            return f"No matching goal found for '{query}'. {ctx}"
+        best = matches[0]
+        best_id = best.get("id", "?")
+        status = best.get("status", "active")
+        return (
+            f"Best match: [{best_id}] \"{best['text'][:100]}\"  ({status})\n\n"
+            f"Call mark_done(item_id='{best_id}') to mark it done."
+        )
+
+    return f"Provide item_id or query. Use show_project_memory to see goal ids. {ctx}"
+
+
+# ── Team handlers ─────────────────────────────────────────────────────────────
+
+def _require_redis_for_team() -> str | None:
+    """Return error message if Redis is not available; None if ok."""
+    if not os.environ.get("MAGNET_REDIS_URL"):
+        return (
+            "Team memory needs shared storage. "
+            "You and your teammates must all set the same MAGNET_REDIS_URL. "
+            "This is a Pro feature — see agentmagnet.app."
+        )
+    return None
+
+
+async def _handle_create_team(team_name: str) -> str:
+    err = _require_redis_for_team()
+    if err:
+        return err
+    from magnet.tier import check_team_feature
+    allowed, plan_label = check_team_feature()
+    if not allowed:
+        return "Team memory is a Pro feature. See agentmagnet.app."
+    # Beta: always allowed — log gate for future billing
+    ts = _get_team_store()
+    try:
+        team_id = await asyncio.to_thread(ts.create_team, team_name, _DEFAULT_USER_ID)
+    except Exception as e:
+        return f"Could not create team: {e}"
+    _get_usage_counter().record_team_write(team_id)
+    return (
+        f"Team '{team_name}' created! Your team id: {team_id}\n\n"
+        f"Share this id with your teammates — they run:\n"
+        f"  *team join {team_id}\n\n"
+        f"Then they add MAGNET_TEAM_ID={team_id} to their MCP config and restart. "
+        f"[{plan_label}]"
+    )
+
+
+async def _handle_join_team(team_id: str) -> str:
+    err = _require_redis_for_team()
+    if err:
+        return err
+    ts = _get_team_store()
+    try:
+        ok = await asyncio.to_thread(ts.join_team, team_id, _DEFAULT_USER_ID)
+    except Exception as e:
+        return f"Could not join team: {e}"
+    if not ok:
+        return f"Team '{team_id}' not found. Check the team_id with the owner."
+    _get_usage_counter().record_team_write(team_id)
+    meta = await asyncio.to_thread(ts.get_team_meta, team_id)
+    team_name = (meta or {}).get("name", team_id)
+    return (
+        f"Joined team '{team_name}' ({team_id}).\n\n"
+        f"Add MAGNET_TEAM_ID={team_id} to your MCP config env and restart Claude. "
+        f"Then your recalls and recaps will include shared team memory."
+    )
+
+
+async def _handle_add_team_member(team_id: str, user_id: str) -> str:
+    err = _require_redis_for_team()
+    if err:
+        return err
+    ts = _get_team_store()
+    try:
+        ok, msg = await asyncio.to_thread(ts.add_member, team_id, _DEFAULT_USER_ID, user_id)
+    except Exception as e:
+        return f"Could not add member: {e}"
+    if not ok:
+        return msg
+    _get_usage_counter().record_team_write(team_id)
+    return f"{msg} They still need to add MAGNET_TEAM_ID={team_id} to their MCP config."
+
+
+async def _handle_list_team_members(team_id: str | None = None) -> str:
+    tid = team_id or _DEFAULT_TEAM_ID
+    if not tid:
+        return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
+    err = _require_redis_for_team()
+    if err:
+        return err
+    ts = _get_team_store()
+    try:
+        meta = await asyncio.to_thread(ts.get_team_meta, tid)
+        members = await asyncio.to_thread(ts.list_members, tid)
+    except Exception as e:
+        return f"Could not list members: {e}"
+    if meta is None:
+        return f"Team '{tid}' not found."
+    lines = [f"Team: {meta.get('name', tid)} ({tid})", ""]
+    for m in members:
+        role_tag = " (owner)" if m["role"] == "owner" else ""
+        lines.append(f"  · {m['user_id']}{role_tag}")
+    lines += ["", f"Total: {len(members)} member{'s' if len(members) != 1 else ''}"]
+    return "\n".join(lines)
+
+
+async def _handle_share_project_to_team(
+    team_id: str | None = None,
+    profile: str | None = None,
+    project: str | None = None,
+) -> str:
+    tid = team_id or _DEFAULT_TEAM_ID
+    if not tid:
+        return "No team set. Use *team new <name> to create one first."
+    err = _require_redis_for_team()
+    if err:
+        return err
+    user, profile, project = _resolve_context(profile, project)
+    store = _get_memory_store()
+    items = await asyncio.to_thread(store.load, user, profile, project)
+    if not items:
+        return f"No memory in {profile} / {project} to share yet."
+    ts = _get_team_store()
+    try:
+        result = await asyncio.to_thread(ts.share_project, user, project, tid, items)
+    except Exception as e:
+        return f"Could not share project: {e}"
+    _get_usage_counter().record_team_write(tid, project)
+    return (
+        f"Shared {result['shared']} item{'s' if result['shared'] != 1 else ''} "
+        f"from {profile} / {project} → team {tid}.\n\n"
+        f"Team members who recall '{project}' will now see these items labeled [team]."
+    )
+
+
+async def _handle_share_item_to_team(
+    item_id: str,
+    team_id: str | None = None,
+    profile: str | None = None,
+    project: str | None = None,
+) -> str:
+    tid = team_id or _DEFAULT_TEAM_ID
+    if not tid:
+        return "No team set. Use *team new <name> to create one first."
+    err = _require_redis_for_team()
+    if err:
+        return err
+    user, profile, project = _resolve_context(profile, project)
+    store = _get_memory_store()
+    items = await asyncio.to_thread(store.load, user, profile, project)
+    ts = _get_team_store()
+    try:
+        result = await asyncio.to_thread(ts.share_item, tid, project, item_id, user, items)
+    except Exception as e:
+        return f"Could not share item: {e}"
+    if "error" in result:
+        return result["error"]
+    if result.get("already_shared"):
+        return f"Already shared: '{result['text']}'"
+    _get_usage_counter().record_team_write(tid, project)
+    return f"Shared [{result['category']}]: '{result['item']}' → team {tid} / {project}."
+
+
+async def _handle_get_team_memory(
+    team_id: str | None = None,
+    project: str | None = None,
+) -> str:
+    tid = team_id or _DEFAULT_TEAM_ID
+    if not tid:
+        return "No team set. Use *team new <name> to create one first."
+    err = _require_redis_for_team()
+    if err:
+        return err
+    _, _, project = _resolve_context(None, project)
+    ts = _get_team_store()
+    try:
+        return await asyncio.to_thread(ts.format_team_display, tid, project)
+    except Exception as e:
+        return f"Could not load team memory: {e}"
+
+
+def _recap_template(project: str, profile: str, by_cat: dict) -> str:
+    """Template-based recap when no LLM key is available."""
+    active_goals = [t for t, s in by_cat.get("goal", []) if s == "active"]
+    done_goals   = [t for t, s in by_cat.get("goal", []) if s == "done"]
+    decisions    = [t for t, _ in by_cat.get("decision", [])]
+    watch_outs   = [t for t, _ in by_cat.get("watch_out", [])]
+    tried        = [t for t, _ in by_cat.get("tried_failed", [])]
+
+    parts: list[str] = []
+
+    if active_goals:
+        parts.append(f"Last time on {project}: working toward — {active_goals[-1]}.")
+    elif decisions:
+        parts.append(f"Last time on {project}: making progress on the build.")
+    else:
+        parts.append(f"Last time on {project}: getting started.")
+
+    if decisions:
+        if len(decisions) == 1:
+            parts.append(f"Decided: {decisions[0]}.")
+        else:
+            parts.append(f"Key decisions: {'; '.join(decisions[-3:])}.")
+
+    if watch_outs:
+        parts.append(f"Heads up — {watch_outs[0]}.")
+    if tried:
+        parts.append(f"Already tried (skip it): {tried[0]}.")
+
+    if active_goals:
+        parts.append(f"Still open: {active_goals[0]}. Want to continue there?")
+    elif done_goals:
+        parts.append("All tracked goals are done. What's next?")
+
+    return " ".join(parts)
+
+
+async def _recap_with_llm(project: str, profile: str, by_cat: dict, openai_key: str) -> str:
+    """LLM-synthesized recap — natural prose, like a teammate catching you up."""
+    import litellm
+
+    active_goals = [t for t, s in by_cat.get("goal", []) if s == "active"]
+    done_goals   = [t for t, s in by_cat.get("goal", []) if s == "done"]
+    decisions    = [t for t, _ in by_cat.get("decision", [])][-6:]
+    watch_outs   = [t for t, _ in by_cat.get("watch_out", [])]
+    tried        = [t for t, _ in by_cat.get("tried_failed", [])]
+    conventions  = [t for t, _ in by_cat.get("convention", [])][-3:]
+    preferences  = [t for t, _ in by_cat.get("preference", [])][-3:]
+
+    sections: list[str] = []
+    if active_goals:  sections.append("Open goals: " + "; ".join(active_goals))
+    if done_goals:    sections.append("Completed goals: " + "; ".join(done_goals))
+    if decisions:     sections.append("Decisions made: " + "; ".join(decisions))
+    if watch_outs:    sections.append("Watch out for: " + "; ".join(watch_outs))
+    if tried:         sections.append("Tried & failed: " + "; ".join(tried))
+    if conventions:   sections.append("Conventions: " + "; ".join(conventions))
+    if preferences:   sections.append("Preferences: " + "; ".join(preferences))
+
+    memory_text = "\n".join(f"- {s}" for s in sections)
+    prompt = (
+        f"You are catching up a developer on their '{project}' project. "
+        "Write a brief 2-4 sentence recap, like a helpful teammate. "
+        "Lead with what they were building, mention the key decisions made, "
+        "flag any watch-outs or failed approaches, and end with the open goal or next step. "
+        "Sound natural and conversational — NOT like a bullet list or database report.\n\n"
+        f"Memory:\n{memory_text}\n\nRecap:"
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            litellm.completion,
+            model="openai/gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            api_key=openai_key,
+            max_tokens=220,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if text:
+            return text
+    except Exception as e:
+        logger.warning(f"[recap] LLM failed ({e}), falling back to template")
+
+    return _recap_template(project, profile, by_cat)
+
+
+async def _handle_recap(profile: str | None = None, project: str | None = None) -> str:
+    user, profile, project = _resolve_context(profile, project)
+    store = _get_memory_store()
+    items = await asyncio.to_thread(store.load, user, profile, project)
+
+    # Merge team items (labeled differently in recap)
+    team_items = await _load_team_items_if_shared(project, _DEFAULT_TEAM_ID)
+    personal_texts = {i.get("text", "").lower() for i in items}
+    for ti in team_items:
+        if ti.get("text", "").lower() not in personal_texts:
+            items.append({**ti, "_team": True})
+
+    if not items:
+        return (
+            f"No memory yet for {profile} / {project} — fresh start. "
+            "What are we working on?"
+        )
+
+    from magnet.project_store import CATEGORIES
+    by_cat: dict[str, list[tuple[str, str]]] = {c: [] for c in CATEGORIES}
+    for item in items:
+        c = item.get("category", "preference")
+        if c in by_cat:
+            text = item["text"]
+            if item.get("_team"):
+                text = f"[team] {text}"
+            by_cat[c].append((text, item.get("status", "active")))
+
+    openai_key = os.environ.get("MAGNET_OPENAI_KEY") or os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        return await _recap_with_llm(project, profile, by_cat, openai_key)
+    return _recap_template(project, profile, by_cat)
+
+
+async def _handle_show_all_memory(
+    show_all: bool = False,
+    profile: str | None = None,
+    project: str | None = None,
+) -> str:
+    user = _DEFAULT_USER_ID
+    store = _get_memory_store()
+
+    if show_all:
+        profiles = await asyncio.to_thread(store.list_profiles, user)
+        if not profiles:
+            return "No memory yet. Say *profiles to create your first profile."
+
+        _cat_labels = {
+            "decision": "decision", "goal": "goal", "watch_out": "watch-out",
+            "tried_failed": "tried & failed", "convention": "convention",
+            "preference": "preference",
+        }
+        lines = ["Your memory — all projects:\n"]
+        for prof_name, _ in profiles:
+            projects = await asyncio.to_thread(store.list_projects, user, prof_name)
+            if not projects:
+                continue
+            lines.append(f"  {prof_name}:")
+            for proj_name in projects:
+                proj_items = await asyncio.to_thread(store.load, user, prof_name, proj_name)
+                if not proj_items:
+                    lines.append(f"    {proj_name} — (empty)")
+                    continue
+                counts: dict[str, int] = {}
+                for it in proj_items:
+                    c = it.get("category", "preference")
+                    counts[c] = counts.get(c, 0) + 1
+                parts = []
+                for cat in ["decision", "goal", "watch_out", "tried_failed", "convention", "preference"]:
+                    n = counts.get(cat, 0)
+                    if n:
+                        lbl = _cat_labels[cat]
+                        parts.append(f"{n} {lbl}{'s' if n != 1 else ''}")
+                lines.append(f"    {proj_name} — {', '.join(parts) if parts else 'empty'}")
+            lines.append("")
+
+        lines.append("Say *memory to see any project in full, or *projects to switch.")
+        return "\n".join(lines)
+
+    # Default: full dump of active project
+    user, profile, project = _resolve_context(profile, project)
     return await asyncio.to_thread(store.format_for_display, user, profile, project)
 
 
@@ -997,8 +1753,25 @@ async def _handle_get_status() -> str:
     else:
         cp_line = "never (no checkpoint yet this session)"
 
+    # Team info
+    team_line = "none (solo mode)"
+    if _DEFAULT_TEAM_ID:
+        try:
+            from magnet.tier import check_team_feature
+            _, plan_label = check_team_feature(_DEFAULT_TEAM_ID)
+            ts = _get_team_store()
+            members = await asyncio.to_thread(ts.list_members, _DEFAULT_TEAM_ID)
+            meta = await asyncio.to_thread(ts.get_team_meta, _DEFAULT_TEAM_ID)
+            team_name = (meta or {}).get("name", _DEFAULT_TEAM_ID)
+            shared = await asyncio.to_thread(ts.is_project_shared, _DEFAULT_TEAM_ID, project)
+            shared_tag = " · project shared ✓" if shared else " · project not yet shared"
+            team_line = f"{team_name} ({len(members)} member{'s' if len(members) != 1 else ''}) · {plan_label}{shared_tag}"
+        except Exception as e:
+            team_line = f"{_DEFAULT_TEAM_ID} (needs Redis to show details)"
+
     lines = [
         f"Active:          {profile} / {project}",
+        f"Team:            {team_line}",
         f"Storage:         {storage_line}",
         f"Save rhythm:     every ~{_SAVE_EVERY} user messages",
         f"Last checkpoint: {cp_line}",

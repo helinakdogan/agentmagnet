@@ -88,6 +88,26 @@ def _claude_md_block(user_id: str) -> str:
         "If the user types *save, call `save_now` (pass ALL messages so far) to do a",
         "cumulative save of everything up to this point.",
         "If the user types *status, call `get_status` to show memory status and usage.",
+        "If the user types *forget <something>, call `forget_memory`. If they reference an item",
+        "by its id (shown in brackets in show_project_memory), delete it directly; otherwise",
+        "find the best text match and present it for confirmation before deleting.",
+        "If the user says a goal is done/completed/finished, call `mark_done`.",
+        "If the user asks where they left off / what were we doing / types *recap,",
+        "call `recap` and deliver it as a natural catch-up, not a list.",
+        "If the user types *memory, call `show_all_memory` for the active project full dump.",
+        "If they say *memory all or ask to see everything across all projects,",
+        "call `show_all_memory` with show_all=true for a cross-project overview.",
+        "",
+        "Team memory (Pro, free during beta — requires shared Redis):",
+        "*team new <name> → call create_team. Returns a team_id to share with teammates.",
+        "*team join <id> → call join_team. Then add MAGNET_TEAM_ID to MCP config.",
+        "*team members → call list_team_members to show who's in the team.",
+        "*team share → call share_project_to_team to share the active project with the team.",
+        "*share <item_id> → call share_item_to_team to share one specific item.",
+        "When working in a shared project (MAGNET_TEAM_ID set and project is shared),",
+        "recall, show_project_memory, and recap automatically merge team memory.",
+        "Team items are labeled [team] so the user can see what's shared vs personal.",
+        "Never expose Redis URLs, storage keys, or backend details — say 'team memory' or 'shared'.",
         "",
         "When the user asks what you know or remember, call `recall` or `show_project_memory`",
         "and answer ONLY from what those tools return — never guess or invent.",
@@ -161,6 +181,7 @@ def _hook_command(env_pairs: list[tuple[str, str]]) -> str:
 def _build_mcp_entry(
     user_id: str, openai_key: str = "", redis_url: str = "",
     team_id: str = "", api_key: str = "", profile_id: str = "",
+    magnet_team_id: str = "",
     # legacy params kept for backward compat with callers that pass positional args
     storage: str = "local",
 ) -> dict:
@@ -171,6 +192,8 @@ def _build_mcp_entry(
         env["MAGNET_REDIS_URL"] = redis_url
     if team_id:
         env["MAGNET_TEAM_ID"] = team_id
+    if magnet_team_id:
+        env["MAGNET_TEAM_ID"] = magnet_team_id
     if api_key:
         env["MAGNET_API_KEY"] = api_key
     if profile_id and profile_id != "default":
@@ -320,11 +343,27 @@ def cmd_init() -> None:
         print("  Skipped — on-device memory and semantic search will be used.")
     print()
 
-    # Advanced options (hidden unless user asks)
+    # Advanced options
     redis_url = ""
-    team_id = ""
     api_key = ""
     profile_id = "default"
+
+    print("  Team setup (optional)")
+    print("  " + "─" * 38)
+    print()
+    print("  Team memory lets you share decisions with teammates.")
+    print("  It requires all team members to use the same Redis instance.")
+    print()
+    team_id = _ask("  Team ID (press Enter to skip — needs shared Redis): ")
+    if team_id:
+        if not redis_url:
+            print()
+            redis_url = _ask("  Redis URL for team (redis://...): ")
+        if redis_url:
+            print(f"  Team: {team_id} · Redis: configured ✓")
+        else:
+            print("  Note: team memory won't work without MAGNET_REDIS_URL.")
+    print()
 
     # 3. Bootstrap default profile + project in local storage
     try:

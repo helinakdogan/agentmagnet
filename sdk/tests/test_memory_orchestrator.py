@@ -37,6 +37,7 @@ def _make_orchestrator(
     episodic.recall.return_value = episodes or []
 
     knowledge = MagicMock(spec=KnowledgeStore)
+    knowledge.build_knowledge_injection.return_value = ""
 
     return MemoryOrchestrator(
         behavioral_store=behavioral,
@@ -186,46 +187,46 @@ class TestShouldStoreEpisode(unittest.TestCase):
     def test_baseline_importance(self):
         orc = self._orc()
         score = orc.should_store_episode([], [])
-        self.assertAlmostEqual(score, 0.3)
+        self.assertAlmostEqual(score, 0.4)  # baseline raised 0.3 → 0.4 in 6375d9b
 
     def test_long_conversation_bonus(self):
         orc = self._orc()
         msgs = [{"role": "user", "content": str(i)} for i in range(8)]
         score = orc.should_store_episode(msgs, [])
-        self.assertGreaterEqual(score, 0.5)  # 0.3 + 0.2
+        self.assertGreaterEqual(score, 0.6)  # 0.4 + 0.2
 
     def test_correction_signal_bonus(self):
         orc = self._orc()
         signals = [{"type": "correction"}]
         score = orc.should_store_episode([], signals)
-        self.assertAlmostEqual(score, 0.45)  # 0.3 + 0.15
+        self.assertAlmostEqual(score, 0.55)  # 0.4 + 0.15
 
     def test_multiple_corrections_capped(self):
         orc = self._orc()
         signals = [{"type": "correction"}] * 5
         score = orc.should_store_episode([], signals)
-        # max correction bonus = 0.4 → 0.3 + 0.4 = 0.7
-        self.assertAlmostEqual(score, 0.7)
+        # max correction bonus = 0.4 → 0.4 + 0.4 = 0.8
+        self.assertAlmostEqual(score, 0.8)
 
     def test_rejection_counts_as_correction(self):
         orc = self._orc()
         signals = [{"type": "rejection"}]
         score = orc.should_store_episode([], signals)
-        self.assertAlmostEqual(score, 0.45)
+        self.assertAlmostEqual(score, 0.55)
 
     def test_preference_signal_bonus(self):
         orc = self._orc()
         signals = [{"type": "preference"}]
         score = orc.should_store_episode([], signals)
-        self.assertAlmostEqual(score, 0.35)  # 0.3 + 0.05
+        self.assertAlmostEqual(score, 0.5)  # 0.4 + 0.1 (bonus raised in ebf4063)
 
     def test_long_conversation_with_corrections(self):
         orc = self._orc()
         msgs = [{"role": "user", "content": str(i)} for i in range(10)]
         signals = [{"type": "correction"}, {"type": "correction"}]
         score = orc.should_store_episode(msgs, signals)
-        # 0.3 + 0.2 + 0.3 = 0.8
-        self.assertAlmostEqual(score, 0.8)
+        # 0.4 + 0.2 + 0.3 = 0.9
+        self.assertAlmostEqual(score, 0.9)
 
     def test_score_never_exceeds_1(self):
         orc = self._orc()

@@ -4,25 +4,28 @@ from magnet.router import ModelRouter
 
 class TestModelRouter(unittest.TestCase):
     def setUp(self):
-        self.config = {
-            "simple": {"openai": "openai/gpt-4o-mini", "anthropic": "anthropic/claude-haiku-4-5"},
-            "medium": {"openai": "openai/gpt-4o", "anthropic": "anthropic/claude-3-5-sonnet"},
-            "complex": {"openai": "openai/gpt-4o", "anthropic": "anthropic/claude-3-opus"},
-            "preferred_provider": "openai",
-        }
-        self.router = ModelRouter(self.config)
+        self.router = ModelRouter(
+            cheap_model="openai/gpt-4o-mini",
+            expensive_model="openai/gpt-4o",
+        )
 
-    def test_base_routing(self):
-        decision = self.router.route("medium", None)
-        self.assertEqual(decision.provider, "openai")
-        self.assertEqual(decision.model, "openai/gpt-4o")
-        self.assertEqual(decision.estimated_cost_tier, "medium")
+    def test_short_simple_message_routes_to_cheap_model(self):
+        messages = [{"role": "user", "content": "hi"}]
+        decision = self.router.route(messages, None)
+        self.assertEqual(decision.selected_model, "openai/gpt-4o-mini")
+        self.assertEqual(decision.estimated_complexity, "simple")
+        self.assertEqual(decision.cost_tier, "cheap")
 
-    def test_provider_override(self):
-        profile = {"preferences": {"preferred_provider": "anthropic"}}
-        decision = self.router.route("medium", profile)
-        self.assertEqual(decision.provider, "anthropic")
-        self.assertEqual(decision.model, "anthropic/claude-3-5-sonnet")
+    def test_long_complex_message_routes_to_expensive_model(self):
+        content = (
+            "detailed analysis, architecture comparison, debug, "
+            "production-ready optimization, comprehensive design review: " + "x" * 600
+        )
+        messages = [{"role": "user", "content": content}]
+        decision = self.router.route(messages, None)
+        self.assertEqual(decision.selected_model, "openai/gpt-4o")
+        self.assertEqual(decision.estimated_complexity, "complex")
+        self.assertEqual(decision.cost_tier, "expensive")
 
 
 if __name__ == "__main__":

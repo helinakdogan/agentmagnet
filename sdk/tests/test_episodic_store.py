@@ -2,8 +2,8 @@
 Tests for EpisodicStore (Layer 2 — Episodic Memory).
 
 Scenarios:
-  - Importance < 0.7 → not stored
-  - Importance >= 0.7 → stored in Redis fallback
+  - Importance < 0.4 → not stored
+  - Importance >= 0.4 → stored in Redis fallback
   - recall() returns episodes with the highest importance
   - _auto_summarize concatenates the latest user messages
   - In-memory fallback is used when Redis and Qdrant are absent
@@ -28,19 +28,19 @@ def _make_messages(n: int = 4) -> list[dict]:
 
 
 class TestEpisodicStoreImportanceFiler(unittest.TestCase):
-    """Episodes with low importance should not be stored."""
+    """Episodes are stored only when importance >= 0.4 (threshold lowered in 86a2c1d)."""
 
-    def test_low_importance_not_stored(self):
+    def test_low_importance_now_stored(self):
         redis_mock = MagicMock()
         store = EpisodicStore(redis_client=redis_mock)
         store.store_episode("tenant:user", _make_messages(), importance=0.5)
-        redis_mock.zadd.assert_not_called()
+        redis_mock.zadd.assert_called_once()
 
-    def test_boundary_importance_not_stored(self):
+    def test_boundary_importance_now_stored(self):
         redis_mock = MagicMock()
         store = EpisodicStore(redis_client=redis_mock)
         store.store_episode("tenant:user", _make_messages(), importance=0.69)
-        redis_mock.zadd.assert_not_called()
+        redis_mock.zadd.assert_called_once()
 
 
 class TestEpisodicStoreRedisBackend(unittest.TestCase):

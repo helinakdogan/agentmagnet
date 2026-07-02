@@ -42,6 +42,16 @@ class UsageCounter:
         self._inc(f"retrievals:{project_id}")
         self._inc("retrievals:total")
 
+    def record_team_write(self, team_id: str, project_id: str = "default") -> None:
+        """Meter team memory writes — for future Pro tier billing."""
+        self._inc(f"team_writes:{team_id}:{project_id}")
+        self._inc("team_writes:total")
+
+    def record_team_recall(self, team_id: str, project_id: str = "default") -> None:
+        """Meter team memory reads — for future Pro tier billing."""
+        self._inc(f"team_recalls:{team_id}:{project_id}")
+        self._inc("team_recalls:total")
+
     def _inc(self, metric: str) -> None:
         if self._redis:
             try:

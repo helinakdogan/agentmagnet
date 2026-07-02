@@ -11,7 +11,7 @@ Stores project memory under a clean three-level hierarchy:
       └── side-thing         →  key: vmm:helin:hobby:side-thing
 
 Key format:   vmm:{user}:{profile}:{project}
-Value:        JSON {"items": [{category, text, confidence, stored_at}]}
+Value:        JSON {"items": [{id, category, text, status, confidence, stored_at}]}
 
 Index key:    vmm:{user}:__index__
 Value:        JSON {"personal": ["general", "kuika"], "hobby": ["side-thing"]}
@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import logging
+import random
+import string
 import time
 from typing import Any
 
@@ -31,22 +33,46 @@ logger = logging.getLogger(__name__)
 _MAX_ENTRIES = 200
 _TTL = 60 * 60 * 24 * 90  # 90 days
 
-CATEGORIES = frozenset({"decision", "watch_out", "tried_failed", "convention", "goal", "preference"})
+CATEGORIES = frozenset({"decision", "convention", "watch_out", "tried_failed", "goal", "preference"})
 
 _LABELS: dict[str, str] = {
-    "goal":         "Working on",
-    "decision":     "Decisions made",
-    "watch_out":    "Watch out for",
-    "tried_failed": "Tried & failed",
+    "decision":     "Decisions",
     "convention":   "Conventions",
+    "watch_out":    "Watch out",
+    "tried_failed": "Tried & failed",
+    "goal":         "Goals",
     "preference":   "Preferences",
 }
-_ORDER = ["goal", "decision", "watch_out", "tried_failed", "convention", "preference"]
+
+# Display order matches the spec example (decisions first, preferences last)
+_DISPLAY_ORDER = ["decision", "convention", "watch_out", "tried_failed", "goal", "preference"]
+# Injection order: high-value context first (decisions + goals + watch-outs), preferences last
+_INJECT_ORDER  = ["decision", "goal", "watch_out", "tried_failed", "convention", "preference"]
+
+_ID_CHARS = string.ascii_lowercase + string.digits
 
 
 def _n(s: str) -> str:
     """Normalize a name: lowercase + strip."""
     return s.strip().lower()
+
+
+def _gen_id() -> str:
+    """Generate a short 6-char alphanumeric ID."""
+    return "".join(random.choices(_ID_CHARS, k=6))
+
+
+def _add_missing_fields(items: list[dict]) -> bool:
+    """Migrate old items that lack 'id' or 'status'. Returns True if any fields were added."""
+    changed = False
+    for item in items:
+        if "id" not in item:
+            item["id"] = _gen_id()
+            changed = True
+        if "status" not in item:
+            item["status"] = "active"
+            changed = True
+    return changed
 
 
 class MemoryStore:
@@ -121,9 +147,15 @@ class MemoryStore:
             if not raw:
                 return []
             data = json.loads(raw)
-            return data.get("items", []) if isinstance(data, dict) else data
-        stored = self._mem.get(key, {})
-        return list(stored.get("items", []))
+            items = data.get("items", []) if isinstance(data, dict) else data
+        else:
+            stored = self._mem.get(key, {})
+            items = list(stored.get("items", []))
+
+        # Lazily migrate old items that predate id/status fields
+        if _add_missing_fields(items):
+            self._save(user, profile, project, items)
+        return items
 
     def _save(self, user: str, profile: str, project: str, items: list[dict]) -> None:
         key = self._key(user, profile, project)
@@ -166,8 +198,10 @@ class MemoryStore:
                 pass
 
         items.append({
+            "id": _gen_id(),
             "category": category,
             "text": text.strip(),
+            "status": "active",
             "confidence": confidence,
             "stored_at": time.time(),
         })
@@ -175,9 +209,32 @@ class MemoryStore:
         logger.info(f"[memory_store] [{category}] saved for {user}/{profile}/{project}")
         return True
 
-    # ── Format helpers ───────────────────────────────────────────────────────────
+    def delete_entry(self, user: str, profile: str, project: str, item_id: str) -> dict | None:
+        """Delete a memory item by id. Returns the removed item, or None if not found."""
+        items = self.load(user, profile, project)
+        for i, item in enumerate(items):
+            if item.get("id") == item_id:
+                removed = items.pop(i)
+                self._save(user, profile, project, items)
+                return removed
+        return None
+
+    def mark_goal_done(self, user: str, profile: str, project: str, item_id: str) -> dict | None:
+        """Mark a goal item as done. Returns updated item, or None if not found or not a goal."""
+        items = self.load(user, profile, project)
+        for item in items:
+            if item.get("id") == item_id:
+                if item.get("category") != "goal":
+                    return None
+                item["status"] = "done"
+                self._save(user, profile, project, items)
+                return item
+        return None
+
+    # ── Group helpers ─────────────────────────────────────────────────────────────
 
     def _group_by_category(self, items: list[dict]) -> dict[str, list[str]]:
+        """Return {category: [text, ...]} — used for compact injection."""
         by_cat: dict[str, list[str]] = {c: [] for c in CATEGORIES}
         for e in items:
             c = e.get("category", "preference")
@@ -185,14 +242,26 @@ class MemoryStore:
                 by_cat[c].append(e["text"])
         return by_cat
 
+    def _group_by_items(self, items: list[dict]) -> dict[str, list[dict]]:
+        """Return {category: [item_dict, ...]} — used for display with IDs."""
+        by_cat: dict[str, list[dict]] = {c: [] for c in CATEGORIES}
+        for e in items:
+            c = e.get("category", "preference")
+            if c in by_cat:
+                by_cat[c].append(e)
+        return by_cat
+
+    # ── Format helpers ───────────────────────────────────────────────────────────
+
     def format_for_injection(self, user: str, profile: str, project: str) -> str:
-        """Compact string for system-prompt injection."""
+        """Compact string for system-prompt injection. Omits done goals."""
         items = self.load(user, profile, project)
-        if not items:
+        active = [i for i in items if i.get("status", "active") != "done"]
+        if not active:
             return ""
-        by_cat = self._group_by_category(items)
+        by_cat = self._group_by_category(active)
         lines: list[str] = []
-        for cat in _ORDER:
+        for cat in _INJECT_ORDER:
             xs = by_cat.get(cat, [])
             if xs:
                 lines.append(f"{_LABELS[cat]}:")
@@ -200,19 +269,109 @@ class MemoryStore:
                     lines.append(f"  - {x}")
         return "\n".join(lines)
 
+    def format_merged_for_injection(
+        self, user: str, profile: str, project: str, team_items: list[dict]
+    ) -> str:
+        """
+        Merge personal + team items for system-prompt injection.
+        Personal items take precedence; team items are deduplicated and labeled [team].
+        Done goals are omitted.
+        """
+        personal = self.load(user, profile, project)
+        active_personal = [i for i in personal if i.get("status", "active") != "done"]
+        personal_texts = {i.get("text", "").lower() for i in active_personal}
+
+        merged = list(active_personal)
+        for ti in team_items:
+            if ti.get("status", "active") == "done":
+                continue
+            if ti.get("text", "").lower() not in personal_texts:
+                merged.append({**ti, "_team": True})
+
+        if not merged:
+            return ""
+
+        by_cat: dict[str, list[str]] = {c: [] for c in CATEGORIES}
+        for item in merged:
+            c = item.get("category", "preference")
+            if c in by_cat:
+                text = item["text"]
+                if item.get("_team"):
+                    text = f"[team] {text}"
+                by_cat[c].append(text)
+
+        lines: list[str] = []
+        for cat in _INJECT_ORDER:
+            xs = by_cat.get(cat, [])
+            if xs:
+                lines.append(f"{_LABELS[cat]}:")
+                for x in xs[-10:]:
+                    lines.append(f"  - {x}")
+        return "\n".join(lines)
+
+    def format_merged_for_display(
+        self, user: str, profile: str, project: str, team_items: list[dict]
+    ) -> str:
+        """
+        Human-readable merged display. Team items labeled [team].
+        Personal items take precedence; team-only items added below.
+        """
+        personal = self.load(user, profile, project)
+        personal_texts = {i.get("text", "").lower() for i in personal}
+
+        all_items = list(personal)
+        for ti in team_items:
+            if ti.get("text", "").lower() not in personal_texts:
+                all_items.append({**ti, "_team": True})
+
+        if not all_items:
+            return f"No memory yet in {profile} / {project}."
+
+        by_cat: dict[str, list[dict]] = {c: [] for c in CATEGORIES}
+        for e in all_items:
+            c = e.get("category", "preference")
+            if c in by_cat:
+                by_cat[c].append(e)
+
+        lines = [f"Memory — {profile} / {project} (with team):"]
+        for cat in _DISPLAY_ORDER:
+            lines.append(f"\n  {_LABELS[cat]}:")
+            xs = by_cat.get(cat, [])
+            if xs:
+                for item in xs[-15:]:
+                    item_id = item.get("id", "??????")
+                    text = item["text"]
+                    team_tag = " [team]" if item.get("_team") else ""
+                    if cat == "goal":
+                        status = item.get("status", "active")
+                        lines.append(f"    [{item_id}]{team_tag} {text}  ({status})")
+                    else:
+                        lines.append(f"    [{item_id}]{team_tag} {text}")
+            else:
+                lines.append("    (none)")
+        return "\n".join(lines)
+
     def format_for_display(self, user: str, profile: str, project: str) -> str:
-        """Human-readable display of project memory."""
+        """Human-readable display with item IDs. Goals show status."""
         items = self.load(user, profile, project)
         if not items:
             return f"No memory yet in {profile} / {project}."
-        by_cat = self._group_by_category(items)
+        by_cat = self._group_by_items(items)
         lines = [f"Memory — {profile} / {project}:"]
-        for cat in _ORDER:
+        for cat in _DISPLAY_ORDER:
+            lines.append(f"\n  {_LABELS[cat]}:")
             xs = by_cat.get(cat, [])
             if xs:
-                lines.append(f"\n  {_LABELS[cat]}:")
-                for x in xs[-15:]:
-                    lines.append(f"    - {x}")
+                for item in xs[-15:]:
+                    item_id = item.get("id", "??????")
+                    text = item["text"]
+                    if cat == "goal":
+                        status = item.get("status", "active")
+                        lines.append(f"    [{item_id}] {text}  ({status})")
+                    else:
+                        lines.append(f"    [{item_id}] {text}")
+            else:
+                lines.append("    (none)")
         return "\n".join(lines)
 
 
