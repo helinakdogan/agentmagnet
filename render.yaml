@@ -12,6 +12,8 @@ services:
         sync: false
       - key: SUPABASE_PROJECT_URL
         sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
       - key: MAGNET_CORS_ORIGINS
         sync: false
       - key: PORT

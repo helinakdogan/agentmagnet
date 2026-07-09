@@ -98,72 +98,58 @@ def _get_jwks_client():
     return _jwks_client
 
 
-def verify_supabase_jwt(token: str) -> str | None:
-    """
-    Returns the Supabase user id (the JWT's `sub` claim) if `token` is a
-    valid, unexpired Supabase session access token — verified against
-    Supabase's public JWKS (asymmetric RS256/ES256), not a shared secret.
-    Returns None on any failure — missing config, malformed token, expired,
-    wrong audience, bad signature — callers should treat every None as a
-    generic 401, same convention as validate_key() above.
-
-    What this currently validates (unchanged by the logging added below):
-      - alg: token must be signed RS256 or ES256 — `algorithms=["RS256", "ES256"]`.
-        A Supabase project still on the legacy HS256 shared-secret signing
-        mode will fail here even with a perfectly valid token, since there's
-        no HS256 key in the JWKS response to resolve.
-      - aud: must be exactly the string "authenticated" — `audience="authenticated"`.
-      - iss: NOT validated at all (no `issuer=` kwarg passed to jwt.decode).
-      - key source: PyJWKClient fetches from
-        {SUPABASE_PROJECT_URL}/auth/v1/.well-known/jwks.json, keyed by the
-        token's `kid` header.
-
-    Logging below is intentionally verbose (WARNING level, so it shows up
-    in Render's default log level) — this is a diagnostic aid, not the
-    normal-operation log volume. Ratchet back to DEBUG once the failure
-    mode is confirmed.
-    """
-    if not token:
-        logger.warning("[auth] verify_supabase_jwt: empty/missing token")
-        return None
-
+def _verify_hs256(token: str) -> dict | None:
+    """HS256 path — Supabase's legacy shared-secret signing mode. Confirmed
+    (via the diagnostic logging previously added here) to be what this
+    project's Supabase instance actually uses."""
     import jwt
 
-    # ── Diagnostics only — peek at the header and claims WITHOUT verifying
-    # the signature. Never used to make an auth decision, only to log what
-    # Supabase actually sent us vs. what we're about to check it against. ──
-    try:
-        header = jwt.get_unverified_header(token)
-        logger.warning(f"[auth] jwt header: alg={header.get('alg')!r} kid={header.get('kid')!r}")
-    except Exception as e:
-        logger.warning(f"[auth] could not decode JWT header ({type(e).__name__}): {e}")
+    secret = os.environ.get("SUPABASE_JWT_SECRET", "")
+    if not secret:
+        logger.warning(
+            "[auth] jwt verification FAILED: token alg is HS256 but SUPABASE_JWT_SECRET is not set "
+            "(set it to the Supabase project's legacy JWT secret — Project Settings > API > JWT Secret)"
+        )
+        return None
 
     try:
-        unverified_claims = jwt.decode(token, options={"verify_signature": False})
-        logger.warning(
-            "[auth] jwt claims (unverified): "
-            f"aud={unverified_claims.get('aud')!r} iss={unverified_claims.get('iss')!r} "
-            f"sub={unverified_claims.get('sub')!r} exp={unverified_claims.get('exp')!r} "
-            "— we validate aud=='authenticated' only; iss is not checked"
-        )
+        return jwt.decode(token, secret, algorithms=["HS256"], audience="authenticated")
+    except jwt.ExpiredSignatureError as e:
+        logger.warning(f"[auth] jwt verification FAILED (HS256): token expired — {e}")
+    except jwt.InvalidAudienceError as e:
+        logger.warning(f"[auth] jwt verification FAILED (HS256): audience mismatch (we require aud=='authenticated') — {e}")
+    except jwt.InvalidSignatureError as e:
+        logger.warning(f"[auth] jwt verification FAILED (HS256): signature invalid — is SUPABASE_JWT_SECRET correct? — {e}")
+    except jwt.PyJWTError as e:
+        logger.warning(f"[auth] jwt verification FAILED (HS256, {type(e).__name__}): {e}")
     except Exception as e:
-        logger.warning(f"[auth] could not decode JWT claims ({type(e).__name__}): {e}")
+        logger.warning(f"[auth] jwt verification FAILED (HS256, unexpected {type(e).__name__}): {e}")
+    return None
+
+
+def _verify_jwks(token: str) -> dict | None:
+    """RS256/ES256 path — Supabase's newer asymmetric signing-key mode.
+    Kept as a fallback for projects that have migrated off the legacy
+    shared secret."""
+    import jwt
 
     project_url = os.environ.get("SUPABASE_PROJECT_URL", "").rstrip("/")
     if not project_url:
-        logger.warning("[auth] verify_supabase_jwt: SUPABASE_PROJECT_URL is not configured — cannot fetch JWKS")
+        logger.warning(
+            "[auth] jwt verification FAILED: token alg is RS256/ES256 but SUPABASE_PROJECT_URL is not set "
+            "(needed to fetch the JWKS)"
+        )
         return None
 
     jwks_url = f"{project_url}/auth/v1/.well-known/jwks.json"
     client = _get_jwks_client()
     if client is None:
-        logger.warning(f"[auth] verify_supabase_jwt: JWKS client unavailable (url would be {jwks_url})")
+        logger.warning(f"[auth] jwt verification FAILED: JWKS client unavailable (url would be {jwks_url})")
         return None
 
-    logger.warning(f"[auth] fetching signing key from JWKS url={jwks_url}")
+    logger.debug(f"[auth] fetching signing key from JWKS url={jwks_url}")
     try:
         signing_key = client.get_signing_key_from_jwt(token)
-        logger.warning(f"[auth] JWKS fetch OK — resolved signing key id={getattr(signing_key, 'key_id', None)!r}")
     except Exception as e:
         # Covers: network/DNS failure hitting jwks_url, HTTP error (404 if
         # the project has no JWKS endpoint at all — i.e. HS256-only
@@ -172,33 +158,81 @@ def verify_supabase_jwt(token: str) -> str | None:
         return None
 
     try:
-        payload = jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=["RS256", "ES256"],
-            audience="authenticated",
-        )
+        return jwt.decode(token, signing_key.key, algorithms=["RS256", "ES256"], audience="authenticated")
     except jwt.ExpiredSignatureError as e:
-        logger.warning(f"[auth] jwt verification FAILED: token expired — {e}")
-        return None
+        logger.warning(f"[auth] jwt verification FAILED (JWKS): token expired — {e}")
     except jwt.InvalidAudienceError as e:
-        logger.warning(f"[auth] jwt verification FAILED: audience mismatch (we require aud=='authenticated') — {e}")
-        return None
-    except jwt.InvalidIssuerError as e:
-        logger.warning(f"[auth] jwt verification FAILED: issuer mismatch — {e}")
-        return None
+        logger.warning(f"[auth] jwt verification FAILED (JWKS): audience mismatch (we require aud=='authenticated') — {e}")
     except jwt.InvalidSignatureError as e:
-        logger.warning(f"[auth] jwt verification FAILED: signature invalid (wrong key, or token wasn't signed with RS256/ES256) — {e}")
-        return None
+        logger.warning(f"[auth] jwt verification FAILED (JWKS): signature invalid — {e}")
     except jwt.InvalidAlgorithmError as e:
-        logger.warning(f"[auth] jwt verification FAILED: token's alg not in ['RS256', 'ES256'] — {e}")
-        return None
+        logger.warning(f"[auth] jwt verification FAILED (JWKS): token's alg not in ['RS256', 'ES256'] — {e}")
     except jwt.PyJWTError as e:
-        logger.warning(f"[auth] jwt verification FAILED ({type(e).__name__}): {e}")
-        return None
+        logger.warning(f"[auth] jwt verification FAILED (JWKS, {type(e).__name__}): {e}")
     except Exception as e:
-        logger.warning(f"[auth] jwt verification FAILED — unexpected error ({type(e).__name__}): {e}")
+        logger.warning(f"[auth] jwt verification FAILED (JWKS, unexpected {type(e).__name__}): {e}")
+    return None
+
+
+def _check_issuer_soft(iss: str | None) -> None:
+    """Warn-only issuer check — never fails the request. Guards against a
+    trailing-slash or scheme mismatch in SUPABASE_PROJECT_URL breaking auth
+    outright; iss just isn't load-bearing for the trust decision here (the
+    signature + audience already prove the token is Supabase's)."""
+    project_url = os.environ.get("SUPABASE_PROJECT_URL", "").rstrip("/")
+    if not project_url:
+        return
+    expected = f"{project_url}/auth/v1"
+    if (iss or "").rstrip("/") != expected.rstrip("/"):
+        logger.warning(f"[auth] jwt issuer mismatch (non-fatal): expected {expected!r}, got {iss!r}")
+
+
+def verify_supabase_jwt(token: str) -> str | None:
+    """
+    Returns the Supabase user id (the JWT's `sub` claim) if `token` is a
+    valid, unexpired Supabase session access token. Returns None on any
+    failure — missing config, malformed token, expired, wrong audience,
+    bad signature — callers should treat every None as a generic 401, same
+    convention as validate_key() above.
+
+    Verification path is chosen from the token's own `alg` header:
+      - HS256        -> verified against the shared secret SUPABASE_JWT_SECRET
+                        (Supabase's legacy signing mode — confirmed to be
+                        what this project uses).
+      - RS256/ES256  -> verified via Supabase's JWKS
+                        ({SUPABASE_PROJECT_URL}/auth/v1/.well-known/jwks.json),
+                        for projects on the newer asymmetric signing keys.
+    aud must be "authenticated" in both paths. iss is checked (against
+    f"{SUPABASE_PROJECT_URL}/auth/v1") as a soft, warning-only match — never
+    a hard failure.
+    """
+    if not token:
+        logger.warning("[auth] verify_supabase_jwt: empty/missing token")
         return None
 
-    logger.warning(f"[auth] jwt verification OK — sub={payload.get('sub')!r}")
+    import jwt
+
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception as e:
+        logger.warning(f"[auth] could not decode JWT header ({type(e).__name__}): {e}")
+        return None
+
+    alg = header.get("alg")
+    logger.debug(f"[auth] jwt header: alg={alg!r} kid={header.get('kid')!r}")
+
+    if alg == "HS256":
+        payload = _verify_hs256(token)
+    elif alg in ("RS256", "ES256"):
+        payload = _verify_jwks(token)
+    else:
+        logger.warning(f"[auth] jwt verification FAILED: unsupported alg {alg!r} (only HS256/RS256/ES256 are handled)")
+        return None
+
+    if payload is None:
+        return None
+
+    _check_issuer_soft(payload.get("iss"))
+
+    logger.debug(f"[auth] jwt verification OK — sub={payload.get('sub')!r}")
     return payload.get("sub")
