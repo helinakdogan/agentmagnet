@@ -6,5 +6,17 @@ services:
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
+  postgres:
+    # pgvector/pgvector ships the `vector` extension pre-built, so local dev
+    # doesn't need to compile it — used for hosted HTTP mode (MAGNET_DATABASE_URL).
+    image: pgvector/pgvector:pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: magnet
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 volumes:
   redis_data:
+  postgres_data:

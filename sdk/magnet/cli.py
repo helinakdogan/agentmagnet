@@ -161,12 +161,41 @@ def _write_json(path: Path, data: dict) -> None:
 
 # ── Binary detection ───────────────────────────────────────────────────────────
 
-def _mcp_command() -> str:
-    """Prefer the installed binary; fall back to python -m."""
+def _find_mcp_binary_path() -> str | None:
+    """
+    Best-effort locate the agent-magnet-mcp console script, even when it's
+    not on PATH — common on Windows, where the Python Scripts dir often
+    isn't added to PATH by default.
+    """
     found = shutil.which("agent-magnet-mcp")
     if found:
         return found
-    return f"{sys.executable} -m magnet.mcp_server"
+
+    exe_name = "agent-magnet-mcp.exe" if platform.system() == "Windows" else "agent-magnet-mcp"
+    py_dir = Path(sys.executable).resolve().parent
+    candidates = [
+        py_dir / exe_name,
+        py_dir / "Scripts" / exe_name,        # Windows venv / user installs
+        py_dir.parent / "Scripts" / exe_name,
+        py_dir / "bin" / exe_name,            # posix venv layout
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+
+
+def _resolve_mcp_command() -> tuple[str, list[str]]:
+    """
+    Resolve (command, args) to launch the MCP server. Prefers the installed
+    console-script binary (by full path, so it works regardless of PATH);
+    falls back to `<python> -m magnet.mcp_server` as command+args (never a
+    single flattened string, which most MCP clients won't shell-parse).
+    """
+    found = _find_mcp_binary_path()
+    if found:
+        return found, []
+    return sys.executable, ["-m", "magnet.mcp_server"]
 
 
 def _hook_command(env_pairs: list[tuple[str, str]]) -> str:
@@ -199,7 +228,13 @@ def _build_mcp_entry(
     if profile_id and profile_id != "default":
         env["MAGNET_PROFILE"] = profile_id
     # No MAGNET_LOCAL_MODE needed — SQLite is now the automatic default
-    return {"command": _mcp_command(), "env": env}
+
+    command, args = _resolve_mcp_command()
+    entry: dict[str, Any] = {"command": command}
+    if args:
+        entry["args"] = args
+    entry["env"] = env
+    return entry
 
 
 # ── Per-tool config writers ────────────────────────────────────────────────────
@@ -268,6 +303,71 @@ def _write_mcp_only(
     return "MCP server"
 
 
+# ── Manual / fallback config ────────────────────────────────────────────────────
+
+def _manual_config_dict(user_id: str) -> dict:
+    """The minimal, universal MCP config block — works with any MCP-compatible client."""
+    return {
+        "mcpServers": {
+            "agent-magnet": {
+                "command": "agent-magnet-mcp",
+                "env": {"MAGNET_USER_ID": user_id},
+            }
+        }
+    }
+
+
+def _print_manual_block(user_id: str) -> None:
+    """
+    Print a ready-to-paste MCP config block for any client, plus a PATH note
+    if 'agent-magnet-mcp' can't be resolved to a bare command.
+    """
+    print("  Manual MCP config (paste into any MCP-compatible client's config):")
+    print()
+    block = json.dumps(_manual_config_dict(user_id), indent=2)
+    for line in block.splitlines():
+        print(f"  {line}")
+    print()
+
+    on_path = shutil.which("agent-magnet-mcp")
+    resolved = _find_mcp_binary_path()
+    if resolved is None:
+        print("  Note: 'agent-magnet-mcp' could not be located at all.")
+        print(f"  Use this instead:")
+        print(f"    \"command\": \"{sys.executable}\"")
+        print(f"    \"args\": [\"-m\", \"magnet.mcp_server\"]")
+        print()
+    elif not on_path:
+        print("  Note: 'agent-magnet-mcp' is not on your PATH (common on Windows).")
+        print(f"  If your client can't launch the bare command above, use the full path instead:")
+        print(f"    \"command\": \"{resolved}\"")
+        print()
+
+
+# ── Local storage bootstrap ─────────────────────────────────────────────────────
+
+def _bootstrap_local_storage(user_id: str) -> None:
+    """Create the default personal/general profile+project and active.json. Tool-agnostic."""
+    try:
+        from magnet.local_store import SQLiteBackend
+        from magnet.project_store import MemoryStore
+        _store = MemoryStore(SQLiteBackend())
+        _store.create_profile(user_id, "personal")
+        _store.create_project(user_id, "personal", "general")
+    except Exception as exc:
+        print(f"  Warning: could not init local storage: {exc}")
+
+    active_path = Path.home() / ".agent-magnet" / "active.json"
+    try:
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text(
+            json.dumps({"profile": "personal", "project": "general"}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print(f"  Warning: could not write active.json: {exc}")
+
+
 # ── Input helpers ──────────────────────────────────────────────────────────────
 
 def _ask(prompt: str, default: str = "") -> str:
@@ -298,13 +398,32 @@ def _ask_bool(prompt: str, default: bool = True) -> bool:
 
 # ── Main init command ──────────────────────────────────────────────────────────
 
-def cmd_init() -> None:
+def cmd_init(manual: bool = False) -> None:
     print()
     print("  Agent Magnet Setup")
     print("  " + "─" * 38)
     print()
 
-    # 1. Detect tools
+    if manual:
+        user_id = _ask("  Your name/identifier: ")
+        if not user_id:
+            user_id = getpass.getuser()
+            print(f"  Using system username: {user_id}")
+        print()
+
+        _bootstrap_local_storage(user_id)
+
+        print("  " + "━" * 38)
+        print("   Manual config")
+        print("  " + "━" * 38)
+        print()
+        _print_manual_block(user_id)
+        print("  Add this to your MCP client's config file, then restart it.")
+        print()
+        return
+
+    # 1. Detect tools — never a dead end: whether or not anything is found,
+    #    we fall through to a summary that always includes the manual block.
     print("  Scanning for AI tools...")
     print()
     found: dict[str, Path] = {}
@@ -319,12 +438,12 @@ def cmd_init() -> None:
 
     if not found:
         print()
-        print("  No AI tools detected. You can still configure manually.")
-        print("  See: https://github.com/helinakdogan/magnet#setup")
+        print("  No known AI tool detected on this machine.")
+        print("  That's fine — Agent Magnet works with any MCP-compatible client.")
+        print("  You'll get a config block to paste in manually below.")
         print()
-        return
 
-    # 2. Just two questions
+    # 2. Questions
     print()
     print("  Configuration")
     print("  " + "─" * 38)
@@ -335,86 +454,74 @@ def cmd_init() -> None:
         user_id = getpass.getuser()
         print(f"  Using system username: {user_id}")
 
-    print()
-    openai_key = _ask_secret(
-        "  OpenAI key for smarter extraction (press Enter to skip — memory works great without it): "
-    )
-    if not openai_key:
-        print("  Skipped — on-device memory and semantic search will be used.")
-    print()
-
-    # Advanced options
+    openai_key = ""
     redis_url = ""
+    team_id = ""
     api_key = ""
     profile_id = "default"
 
-    print("  Team setup (optional)")
-    print("  " + "─" * 38)
-    print()
-    print("  Team memory lets you share decisions with teammates.")
-    print("  It requires all team members to use the same Redis instance.")
-    print()
-    team_id = _ask("  Team ID (press Enter to skip — needs shared Redis): ")
-    if team_id:
-        if not redis_url:
-            print()
-            redis_url = _ask("  Redis URL for team (redis://...): ")
-        if redis_url:
-            print(f"  Team: {team_id} · Redis: configured ✓")
-        else:
-            print("  Note: team memory won't work without MAGNET_REDIS_URL.")
-    print()
-
-    # 3. Bootstrap default profile + project in local storage
-    try:
-        from magnet.local_store import SQLiteBackend
-        from magnet.project_store import MemoryStore
-        _store = MemoryStore(SQLiteBackend())
-        _store.create_profile(user_id, "personal")
-        _store.create_project(user_id, "personal", "general")
-    except Exception as exc:
-        print(f"  Warning: could not init local storage: {exc}")
-
-    # Write active.json
-    active_path = Path.home() / ".agent-magnet" / "active.json"
-    try:
-        active_path.parent.mkdir(parents=True, exist_ok=True)
-        active_path.write_text(
-            json.dumps({"profile": "personal", "project": "general"}, indent=2),
-            encoding="utf-8",
+    if found:
+        print()
+        openai_key = _ask_secret(
+            "  OpenAI key for smarter extraction (press Enter to skip — memory works great without it): "
         )
-    except Exception as exc:
-        print(f"  Warning: could not write active.json: {exc}")
+        if not openai_key:
+            print("  Skipped — on-device memory and semantic search will be used.")
+        print()
 
-    # 4. Write configs
-    print("  Writing configuration...")
-    print()
-
-    writers = {
-        "Claude Code": _write_claude_code,
-        "Claude Desktop": _write_mcp_only,
-        "Cursor": _write_mcp_only,
-    }
-
-    for tool_name, path in found.items():
-        writer = writers.get(tool_name, _write_mcp_only)
-        try:
-            action = writer(path, user_id, openai_key, redis_url, team_id, api_key, profile_id)
-            print(f"    ✓ {tool_name} — {action}")
-        except Exception as exc:
-            print(f"    ✗ {tool_name} — failed: {exc}")
-
-    if "Claude Code" in found:
-        try:
-            written = _write_claude_md(user_id)
-            if written:
-                print(f"    ✓ ~/.claude/CLAUDE.md — memory auto-trigger added")
+        print("  Team setup (optional)")
+        print("  " + "─" * 38)
+        print()
+        print("  Team memory lets you share decisions with teammates.")
+        print("  It requires all team members to use the same Redis instance.")
+        print()
+        team_id = _ask("  Team ID (press Enter to skip — needs shared Redis): ")
+        if team_id:
+            if not redis_url:
+                print()
+                redis_url = _ask("  Redis URL for team (redis://...): ")
+            if redis_url:
+                print(f"  Team: {team_id} · Redis: configured ✓")
             else:
-                print(f"    – ~/.claude/CLAUDE.md — already configured, skipped")
-        except Exception as exc:
-            print(f"    ✗ ~/.claude/CLAUDE.md — failed: {exc}")
+                print("  Note: team memory won't work without MAGNET_REDIS_URL.")
+        print()
 
-    # 5. Summary
+    # 3. Bootstrap default profile + project in local storage (tool-agnostic)
+    _bootstrap_local_storage(user_id)
+
+    # 4. Write configs for whatever was detected
+    written: dict[str, Path] = {}
+    if found:
+        print("  Writing configuration...")
+        print()
+
+        writers = {
+            "Claude Code": _write_claude_code,
+            "Claude Desktop": _write_mcp_only,
+            "Cursor": _write_mcp_only,
+        }
+
+        for tool_name, path in found.items():
+            writer = writers.get(tool_name, _write_mcp_only)
+            try:
+                action = writer(path, user_id, openai_key, redis_url, team_id, api_key, profile_id)
+                print(f"    ✓ {tool_name} — {action}")
+                written[tool_name] = path
+            except Exception as exc:
+                print(f"    ✗ {tool_name} — failed: {exc}")
+
+        if "Claude Code" in found:
+            try:
+                ok = _write_claude_md(user_id)
+                if ok:
+                    print(f"    ✓ ~/.claude/CLAUDE.md — memory auto-trigger added")
+                else:
+                    print(f"    – ~/.claude/CLAUDE.md — already configured, skipped")
+            except Exception as exc:
+                print(f"    ✗ ~/.claude/CLAUDE.md — failed: {exc}")
+
+    # 5. Summary — always printed, regardless of whether detection succeeded,
+    #    so no user is ever left stuck on an unrecognized platform.
     db_path = Path.home() / ".agent-magnet" / "memory.db"
     print()
     print("  " + "━" * 38)
@@ -427,11 +534,35 @@ def cmd_init() -> None:
     print(f"  Active context: personal / general")
     print(f"  Memory stored at: {db_path}")
     print()
-    print("  Restart your AI tools, then type *profiles or *projects to get started.")
-    if not openai_key:
+
+    if written:
+        print("  Config written to:")
+        for tool_name, path in written.items():
+            print(f"    · {tool_name}: {path}")
         print()
-        print("  For smarter extraction, add MAGNET_OPENAI_KEY to your tool's MCP config.")
+
+    _print_manual_block(user_id)
+
+    if written:
+        print("  Using another MCP client too? Paste the block above into its config as well.")
+    else:
+        print("  Paste the block above into your MCP-compatible client's config, then restart it.")
     print()
+    if not openai_key and found:
+        print("  For smarter extraction, add MAGNET_OPENAI_KEY to your tool's MCP config.")
+        print()
+    print("  Then type *profiles or *projects to get started.")
+    print()
+
+
+def cmd_config(argv: list[str]) -> None:
+    """Print the current recommended MCP config block on demand, any time."""
+    user_id = argv[0] if argv else getpass.getuser()
+    print()
+    print("  Agent Magnet — MCP config")
+    print("  " + "─" * 38)
+    print()
+    _print_manual_block(user_id)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -443,12 +574,18 @@ def main(args: list[str] | None = None) -> None:
         print("Usage: agent-magnet <command>")
         print()
         print("Commands:")
-        print("  init    Configure AI tools with Agent Magnet")
+        print("  init             Detect AI tools and configure Agent Magnet")
+        print("  init --manual    Skip detection — just print a config block to paste anywhere")
+        print("  config [name]    Print the recommended MCP config block on demand")
         print()
         return
 
     if argv[0] == "init":
-        cmd_init()
+        cmd_init(manual="--manual" in argv[1:])
+        return
+
+    if argv[0] == "config":
+        cmd_config(argv[1:])
         return
 
     print(f"Unknown command: {argv[0]}")

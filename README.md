@@ -6,14 +6,14 @@
   <a href="https://agentmagnet.app/docs">
     <img src="https://img.shields.io/badge/Docs-agentmagnet.app-8B5CF6?style=for-the-badge">
   </a>
-  <a href="https://github.com/helinakdogan/magnet-gateway/blob/main/LICENSE">
+  <a href="https://github.com/helinakdogan/agentmagnet/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-A855F7?style=for-the-badge">
   </a>
   <a href="https://agentmagnet.app">
     <img src="https://img.shields.io/badge/Built%20by-Agent%20Magnet-C084FC?style=for-the-badge">
   </a>
   <img src="https://img.shields.io/pypi/v/agent-magnet?label=PyPI&labelColor=111827&color=8B5CF6" alt="PyPI">
-  <img src="https://img.shields.io/github/last-commit/helinakdogan/magnet-gateway?label=Last%20commit&labelColor=111827&color=C084FC" alt="Last Commit">
+  <img src="https://img.shields.io/github/last-commit/helinakdogan/agentmagnet?label=Last%20commit&labelColor=111827&color=C084FC" alt="Last Commit">
   <a href="https://registry.modelcontextprotocol.io/servers/app.agentmagnet/agent-magnet">
     <img src="https://img.shields.io/badge/MCP%20Registry-agent--magnet-8B5CF6?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48Y2lyY2xlIGN4PSI4IiBjeT0iOCIgcj0iOCIgZmlsbD0id2hpdGUiLz48L3N2Zz4=" alt="MCP Registry">
   </a>
@@ -290,9 +290,25 @@ Every request automatically saves and recalls memory. No manual commands, no set
 
 ---
 
+## Hosted / Remote MCP
+
+Everything above is the free, local-first path: `pip install`, local SQLite, zero keys, data never leaves your machine. That stays the default.
+
+If you'd rather not run anything locally, Agent Magnet can also run as a **hosted remote MCP server** reachable by URL — this is what lets you add it as a custom connector in Claude, or use it from Cursor/Codex/ChatGPT without a local process. It requires a Pro API key (`mg_sk_...`).
+
+**Claude — Add custom connector:**
+
+1. In Claude, go to Settings → Connectors → Add custom connector.
+2. URL: `https://<your-hosted-magnet-host>/mcp`
+3. Authorization: `Bearer mg_sk_...` (your Agent Magnet API key from [agentmagnet.app](https://agentmagnet.app))
+
+That's it — recall, remember, checkpoint, and every other tool documented above work identically over the hosted connection; memory is stored on the hosted Postgres backend instead of your local machine, and usage is metered against your plan.
+
+---
+
 ## Contributing
 
-- **Issues**: [Report a bug or request a feature](https://github.com/helinakdogan/magnet-gateway/issues)
+- **Issues**: [Report a bug or request a feature](https://github.com/helinakdogan/agentmagnet/issues)
 - **X**: [@AgentMagnetAI](https://twitter.com/AgentMagnetAI)
 
 If Magnet saved you from a bad context window, give it a ⭐

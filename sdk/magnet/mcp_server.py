@@ -37,6 +37,7 @@ Alias tools (backward compat — same behavior as primary):
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -54,9 +55,57 @@ _DEFAULT_USER_ID = os.environ.get("MAGNET_USER_ID", "user")
 _DEFAULT_TEAM_ID = os.environ.get("MAGNET_TEAM_ID", "")
 _ACTIVE_FILE = Path.home() / ".agent-magnet" / "active.json"
 
+# ── Per-request identity (HTTP/hosted mode only) ─────────────────────────────
+#
+# stdio mode is one user per process — _DEFAULT_USER_ID/_DEFAULT_TEAM_ID
+# (env vars, fixed at import time) are all it ever needs.
+#
+# HTTP mode serves many users concurrently in one process. http_server.py's
+# auth middleware resolves identity from the validated API key (never from
+# the request body) and sets it here, scoped to that request's asyncio task
+# via contextvars — so concurrent requests can never see each other's
+# identity. _UNSET (not None/"") is the sentinel so a real "no team" ("")
+# is distinguishable from "contextvar was never set" (stdio mode).
+
+_UNSET = object()
+_user_id_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("magnet_user_id", default=_UNSET)
+_team_id_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("magnet_team_id", default=_UNSET)
+
+
+def _current_user_id() -> str:
+    v = _user_id_ctx.get()
+    return _DEFAULT_USER_ID if v is _UNSET else v
+
+
+def _current_team_id() -> str:
+    v = _team_id_ctx.get()
+    return _DEFAULT_TEAM_ID if v is _UNSET else v
+
+
+def _set_current_identity(user_id: str, team_id: str) -> tuple:
+    """Called only by http_server.py's auth middleware, once per request."""
+    return _user_id_ctx.set(user_id), _team_id_ctx.set(team_id)
+
+
+def _reset_current_identity(tokens: tuple) -> None:
+    """Called only by http_server.py's auth middleware, in a finally block."""
+    _user_id_ctx.reset(tokens[0])
+    _team_id_ctx.reset(tokens[1])
+
+
+def _in_hosted_request() -> bool:
+    return _user_id_ctx.get() is not _UNSET
+
+
 # ── Active context ────────────────────────────────────────────────────────────
 
 def _read_active_context() -> dict:
+    if _in_hosted_request():
+        raw = _get_backend().get(f"vmm:{_current_user_id()}:__active__")
+        try:
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
     try:
         if _ACTIVE_FILE.exists():
             return json.loads(_ACTIVE_FILE.read_text(encoding="utf-8"))
@@ -66,6 +115,10 @@ def _read_active_context() -> dict:
 
 
 def _write_active_context(profile: str, project: str) -> None:
+    payload = json.dumps({"profile": profile, "project": project}, ensure_ascii=False)
+    if _in_hosted_request():
+        _get_backend().set(f"vmm:{_current_user_id()}:__active__", payload)
+        return
     _ACTIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
     _ACTIVE_FILE.write_text(
         json.dumps({"profile": profile, "project": project}, indent=2),
@@ -74,11 +127,11 @@ def _write_active_context(profile: str, project: str) -> None:
 
 
 def _resolve_context(profile: str | None = None, project: str | None = None) -> tuple[str, str, str]:
-    """Return (user, profile, project) — fills gaps from active.json."""
+    """Return (user, profile, project) — fills gaps from active context."""
     active = _read_active_context()
     resolved_profile = profile or active.get("profile") or "personal"
     resolved_project = project or active.get("project") or "general"
-    return _DEFAULT_USER_ID, resolved_profile, resolved_project
+    return _current_user_id(), resolved_profile, resolved_project
 
 
 def _ctx_tag(profile: str, project: str) -> str:
@@ -91,6 +144,14 @@ _RHYTHM_FILE = Path.home() / ".agent-magnet" / "rhythm.json"
 
 def _read_rhythm(profile: str, project: str) -> dict:
     key = f"{profile}/{project}"
+    if _in_hosted_request():
+        # Same fixed-file leak class as active.json — must be per-user in
+        # hosted mode, or concurrent users' checkpoint rhythms collide.
+        raw = _get_backend().get(f"vmm:{_current_user_id()}:__rhythm__:{key}")
+        try:
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
     try:
         if _RHYTHM_FILE.exists():
             return json.loads(_RHYTHM_FILE.read_text(encoding="utf-8")).get(key, {})
@@ -101,6 +162,16 @@ def _read_rhythm(profile: str, project: str) -> dict:
 
 def _write_rhythm(profile: str, project: str, **updates: Any) -> None:
     key = f"{profile}/{project}"
+    if _in_hosted_request():
+        backend = _get_backend()
+        rkey = f"vmm:{_current_user_id()}:__rhythm__:{key}"
+        try:
+            data = _read_rhythm(profile, project)
+            data.update(updates)
+            backend.set(rkey, json.dumps(data, ensure_ascii=False))
+        except Exception as e:
+            logger.debug(f"[rhythm] hosted write failed: {e}")
+        return
     try:
         data: dict = {}
         if _RHYTHM_FILE.exists():
@@ -148,18 +219,21 @@ async def _extract_from_messages(messages: list[dict], user: str, profile: str, 
 _backend: Any = None
 _memory: Any = None
 _memory_store: Any = None
-_usage_counter: Any = None
 _compressor: Any = None
 _team_store: Any = None
 
 
 def _get_backend() -> Any:
-    """Shared Redis or SQLite backend — initialized once."""
+    """Shared Redis, Postgres, or SQLite backend — initialized once.
+
+    Resolution order: Redis (MAGNET_REDIS_URL) > Postgres (MAGNET_DATABASE_URL,
+    hosted HTTP mode) > SQLite (default, stdio/free tier — unchanged)."""
     global _backend
     if _backend is not None:
         return _backend
 
     redis_url = os.environ.get("MAGNET_REDIS_URL")
+    database_url = os.environ.get("MAGNET_DATABASE_URL")
     client: Any = None
     if redis_url:
         try:
@@ -169,6 +243,14 @@ def _get_backend() -> Any:
             logger.info("[magnet] Redis connected")
         except Exception as e:
             logger.warning(f"[magnet] Redis unavailable ({e}); falling back to SQLite")
+
+    if client is None and database_url:
+        try:
+            from magnet.postgres_store import PostgresBackend
+            client = PostgresBackend(database_url)
+            logger.info("[magnet] Postgres connected (hosted mode)")
+        except Exception as e:
+            logger.warning(f"[magnet] Postgres unavailable ({e}); falling back to SQLite")
 
     if client is None:
         from magnet.local_store import SQLiteBackend
@@ -193,7 +275,7 @@ def _get_memory() -> Any:
         redis_client=_get_backend(),
         qdrant_url=qdrant_url,
         qdrant_api_key=qdrant_api_key,
-        enable_aggregate=bool(os.environ.get("MAGNET_REDIS_URL")),
+        enable_aggregate=bool(os.environ.get("MAGNET_REDIS_URL") or os.environ.get("MAGNET_DATABASE_URL")),
     )
     return _memory
 
@@ -208,11 +290,13 @@ def _get_memory_store() -> Any:
 
 
 def _get_usage_counter() -> Any:
-    global _usage_counter
-    if _usage_counter is None:
-        from magnet.usage_counter import UsageCounter
-        _usage_counter = UsageCounter(redis_client=_get_backend(), user_id=_DEFAULT_USER_ID)
-    return _usage_counter
+    """UsageCounter is a thin, stateless wrapper — constructed fresh per call
+    (not cached) so it's always bound to the CURRENT request's user_id. It
+    used to be a process-wide singleton baked with _DEFAULT_USER_ID at first
+    call, which was correct for stdio (one user per process) but would leak
+    identity across concurrent HTTP requests from different users."""
+    from magnet.usage_counter import UsageCounter
+    return UsageCounter(redis_client=_get_backend(), user_id=_current_user_id())
 
 
 def _get_compressor() -> Any:
@@ -921,8 +1005,20 @@ async def list_tools() -> list[types.Tool]:
 
 # ── Tool dispatch ─────────────────────────────────────────────────────────────
 
+def _record_usage_event(tool_name: str) -> None:
+    """Fires on every tool call, both transports. No-op outside hosted/
+    Postgres mode (record_usage_event itself checks). Wrapped so metering
+    can never break a tool response."""
+    try:
+        from magnet.usage_counter import record_usage_event
+        record_usage_event(_current_user_id(), _current_team_id(), tool_name)
+    except Exception as e:
+        logger.debug(f"[usage] _record_usage_event failed: {e}")
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    _record_usage_event(name)
     try:
         if name == "recall" or name == "inject_memory":
             result = await _handle_recall(
@@ -1077,7 +1173,7 @@ async def _handle_recall(profile: str | None = None, project: str | None = None)
 
     usage.record_retrieval(project)
 
-    team_id = _DEFAULT_TEAM_ID
+    team_id = _current_team_id()
     team_items = await _load_team_items_if_shared(project, team_id)
 
     if team_items:
@@ -1139,19 +1235,19 @@ async def _handle_remember(
     preview = extracted[:80] + ("…" if len(extracted) > 80 else "")
 
     auto_promoted = False
-    if saved and _DEFAULT_TEAM_ID:
+    if saved and _current_team_id():
         # Check if this new item agrees with an existing team item → auto-promote
         try:
             ts = _get_team_store()
-            if await asyncio.to_thread(ts.is_project_shared, _DEFAULT_TEAM_ID, project):
+            if await asyncio.to_thread(ts.is_project_shared, _current_team_id(), project):
                 items = await asyncio.to_thread(store.load, user, profile, project)
                 new_item = items[-1] if items else None
                 if new_item:
                     auto_promoted = await asyncio.to_thread(
-                        ts.auto_promote_if_agreed, _DEFAULT_TEAM_ID, project, new_item, user
+                        ts.auto_promote_if_agreed, _current_team_id(), project, new_item, user
                     )
                     if auto_promoted:
-                        usage.record_team_write(_DEFAULT_TEAM_ID, project)
+                        usage.record_team_write(_current_team_id(), project)
         except Exception as e:
             logger.debug(f"[team] auto-promote check failed: {e}")
 
@@ -1164,7 +1260,7 @@ async def _handle_remember(
 async def _handle_show_project_memory(profile: str | None = None, project: str | None = None) -> str:
     user, profile, project = _resolve_context(profile, project)
     store = _get_memory_store()
-    team_items = await _load_team_items_if_shared(project, _DEFAULT_TEAM_ID)
+    team_items = await _load_team_items_if_shared(project, _current_team_id())
     if team_items:
         return await asyncio.to_thread(store.format_merged_for_display, user, profile, project, team_items)
     return await asyncio.to_thread(store.format_for_display, user, profile, project)
@@ -1270,7 +1366,7 @@ async def _handle_create_team(team_name: str) -> str:
     # Beta: always allowed — log gate for future billing
     ts = _get_team_store()
     try:
-        team_id = await asyncio.to_thread(ts.create_team, team_name, _DEFAULT_USER_ID)
+        team_id = await asyncio.to_thread(ts.create_team, team_name, _current_user_id())
     except Exception as e:
         return f"Could not create team: {e}"
     _get_usage_counter().record_team_write(team_id)
@@ -1289,7 +1385,7 @@ async def _handle_join_team(team_id: str) -> str:
         return err
     ts = _get_team_store()
     try:
-        ok = await asyncio.to_thread(ts.join_team, team_id, _DEFAULT_USER_ID)
+        ok = await asyncio.to_thread(ts.join_team, team_id, _current_user_id())
     except Exception as e:
         return f"Could not join team: {e}"
     if not ok:
@@ -1310,7 +1406,7 @@ async def _handle_add_team_member(team_id: str, user_id: str) -> str:
         return err
     ts = _get_team_store()
     try:
-        ok, msg = await asyncio.to_thread(ts.add_member, team_id, _DEFAULT_USER_ID, user_id)
+        ok, msg = await asyncio.to_thread(ts.add_member, team_id, _current_user_id(), user_id)
     except Exception as e:
         return f"Could not add member: {e}"
     if not ok:
@@ -1320,7 +1416,7 @@ async def _handle_add_team_member(team_id: str, user_id: str) -> str:
 
 
 async def _handle_list_team_members(team_id: str | None = None) -> str:
-    tid = team_id or _DEFAULT_TEAM_ID
+    tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
     err = _require_redis_for_team()
@@ -1354,7 +1450,7 @@ def _format_shared_projects_menu(team_id: str, shared_projects: list[dict]) -> s
 
 
 async def _handle_list_team_projects(team_id: str | None = None) -> str:
-    tid = team_id or _DEFAULT_TEAM_ID
+    tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
     err = _require_redis_for_team()
@@ -1375,7 +1471,7 @@ async def _handle_share_project_to_team(
     profile: str | None = None,
     project: str | None = None,
 ) -> str:
-    tid = team_id or _DEFAULT_TEAM_ID
+    tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
     err = _require_redis_for_team()
@@ -1405,7 +1501,7 @@ async def _handle_share_item_to_team(
     profile: str | None = None,
     project: str | None = None,
 ) -> str:
-    tid = team_id or _DEFAULT_TEAM_ID
+    tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
     err = _require_redis_for_team()
@@ -1431,7 +1527,7 @@ async def _handle_get_team_memory(
     team_id: str | None = None,
     project: str | None = None,
 ) -> str:
-    tid = team_id or _DEFAULT_TEAM_ID
+    tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
     err = _require_redis_for_team()
@@ -1560,7 +1656,7 @@ async def _handle_recap(profile: str | None = None, project: str | None = None) 
     items = await asyncio.to_thread(store.load, user, profile, project)
 
     # Merge team items (labeled differently in recap)
-    team_items = await _load_team_items_if_shared(project, _DEFAULT_TEAM_ID)
+    team_items = await _load_team_items_if_shared(project, _current_team_id())
     personal_texts = {i.get("text", "").lower() for i in items}
     for ti in team_items:
         if ti.get("text", "").lower() not in personal_texts:
@@ -1593,7 +1689,7 @@ async def _handle_show_all_memory(
     profile: str | None = None,
     project: str | None = None,
 ) -> str:
-    user = _DEFAULT_USER_ID
+    user = _current_user_id()
     store = _get_memory_store()
 
     if show_all:
@@ -1639,7 +1735,7 @@ async def _handle_show_all_memory(
 
 
 async def _handle_list_profiles() -> str:
-    user = _DEFAULT_USER_ID
+    user = _current_user_id()
     store = _get_memory_store()
     profiles = await asyncio.to_thread(store.list_profiles, user)
 
@@ -1676,7 +1772,7 @@ async def _handle_list_projects(profile: str | None = None) -> str:
 
 
 async def _handle_set_active_context(profile: str, project: str | None = None) -> str:
-    user = _DEFAULT_USER_ID
+    user = _current_user_id()
     store = _get_memory_store()
 
     # Ensure profile exists
@@ -1706,7 +1802,7 @@ async def _handle_get_active_context() -> str:
 
 
 async def _handle_create_profile(name: str) -> str:
-    user = _DEFAULT_USER_ID
+    user = _current_user_id()
     store = _get_memory_store()
     created = await asyncio.to_thread(store.create_profile, user, name)
     active = _read_active_context()
@@ -1791,11 +1887,15 @@ async def _handle_get_status() -> str:
     if backend_type == "SQLiteBackend":
         db_path = Path.home() / ".agent-magnet" / "memory.db"
         storage_line = f"local (this machine) — {db_path}"
+    elif backend_type == "PostgresBackend":
+        storage_line = "hosted (Postgres)"
     else:
         storage_line = "cloud (Redis)"
 
     # Plan
-    if os.environ.get("MAGNET_API_KEY"):
+    if backend_type == "PostgresBackend":
+        plan_line = "Hosted Magnet — metered"
+    elif os.environ.get("MAGNET_API_KEY"):
         plan_line = "Hosted Magnet — metered"
     elif os.environ.get("MAGNET_REDIS_URL"):
         plan_line = "Self-hosted Redis — unlimited"
@@ -1830,19 +1930,19 @@ async def _handle_get_status() -> str:
 
     # Team info
     team_line = "none (solo mode)"
-    if _DEFAULT_TEAM_ID:
+    if _current_team_id():
         try:
             from magnet.tier import check_team_feature
-            _, plan_label = check_team_feature(_DEFAULT_TEAM_ID)
+            _, plan_label = check_team_feature(_current_team_id())
             ts = _get_team_store()
-            members = await asyncio.to_thread(ts.list_members, _DEFAULT_TEAM_ID)
-            meta = await asyncio.to_thread(ts.get_team_meta, _DEFAULT_TEAM_ID)
-            team_name = (meta or {}).get("name", _DEFAULT_TEAM_ID)
-            shared = await asyncio.to_thread(ts.is_project_shared, _DEFAULT_TEAM_ID, project)
+            members = await asyncio.to_thread(ts.list_members, _current_team_id())
+            meta = await asyncio.to_thread(ts.get_team_meta, _current_team_id())
+            team_name = (meta or {}).get("name", _current_team_id())
+            shared = await asyncio.to_thread(ts.is_project_shared, _current_team_id(), project)
             shared_tag = " · project shared ✓" if shared else " · project not yet shared"
             team_line = f"{team_name} ({len(members)} member{'s' if len(members) != 1 else ''}) · {plan_label}{shared_tag}"
         except Exception as e:
-            team_line = f"{_DEFAULT_TEAM_ID} (needs Redis to show details)"
+            team_line = f"{_current_team_id()} (needs Redis to show details)"
 
     lines = [
         f"Active:          {profile} / {project}",
@@ -1855,6 +1955,14 @@ async def _handle_get_status() -> str:
         f"All-time writes: {total_writes} | recalls: {total_retrievals}",
         f"Plan:            {plan_line}",
     ]
+
+    if backend_type == "PostgresBackend":
+        from magnet.usage_counter import get_hosted_usage_summary
+        summary = get_hosted_usage_summary(user, _current_team_id())
+        if summary:
+            period_line = ", ".join(f"{k}: {v}" for k, v in sorted(summary.items()))
+            lines.append(f"This period:     {period_line}")
+
     return "\n".join(lines)
 
 
@@ -1909,7 +2017,7 @@ async def _handle_usage_stats() -> dict:
     _, profile, project = _resolve_context()
     stats = _get_usage_counter().get_stats()
     return {
-        "user": _DEFAULT_USER_ID,
+        "user": _current_user_id(),
         "active_context": _ctx_tag(profile, project),
         "stats": stats,
         "note": "Metering active. Local mode is unlimited.",

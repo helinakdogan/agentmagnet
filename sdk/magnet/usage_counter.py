@@ -8,10 +8,14 @@ Storage:
   - Local (no Redis): ~/.agent-magnet/usage.json
   - Redis: hash at  magnet:usage:{user_id}
 
-TODO — future enforcement point:
-  check_usage_limit() currently always returns True (allowed).
-  When hosted mode is introduced (MAGNET_API_KEY), plug quota checks here.
-  Local mode (no API key) is unlimited — runs on the user's own storage/compute.
+For hosted HTTP mode, module-level check_usage_limit()/record_usage_event()/
+get_hosted_usage_summary() below read/write the usage_events table in
+Postgres (see postgres_store.py) — a per-tool-call event log, distinct from
+this class's older hincrby counters (which keep working unchanged for
+stdio mode). The TODO — future enforcement point — lives on
+check_usage_limit(): it currently always returns True (allowed). When
+billing goes live, plug a Stripe subscription/quota check there. Local
+stdio mode never calls it at all and is always unlimited.
 """
 
 from __future__ import annotations
@@ -101,3 +105,72 @@ class UsageCounter:
         and return False when exceeded. Local mode (no API key) is always unlimited.
         """
         return True
+
+
+# ── Hosted mode (HTTP) — event log + enforcement seam ─────────────────────────
+#
+# These are module-level, not UsageCounter methods, because they're keyed by
+# (user_id, team_id) resolved fresh per HTTP request from the validated API
+# key — not bound to a single cached instance the way UsageCounter used to be.
+
+
+def check_usage_limit(user_id: str, team_id: str = "") -> bool:  # noqa: ARG001
+    """
+    ALWAYS returns True today — metering only, no enforcement.
+
+    TODO: BILLING HOOK — plug a Stripe subscription/quota check here. This is
+    the single seam where future enforcement reads the user's/team's plan
+    (api_keys.plan, or a live Stripe lookup) plus the aggregated usage_events
+    counts for the current billing period (see get_hosted_usage_summary
+    below) and returns False once a paid quota is exceeded. Called once per
+    authenticated HTTP request from http_server.py's auth middleware, before
+    the request is allowed to reach the MCP transport. Never called in
+    stdio mode (local/free tier is always unlimited).
+    """
+    return True
+
+
+def record_usage_event(user_id: str, team_id: str, event_type: str) -> None:
+    """Best-effort INSERT into usage_events. No-op outside hosted/Postgres
+    mode. Metering must never break a tool call — all failures are swallowed
+    (logged at debug level only)."""
+    from magnet.postgres_store import get_pool_if_configured
+
+    pool = get_pool_if_configured()
+    if pool is None:
+        return
+    try:
+        with pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO usage_events (user_id, team_id, event_type) VALUES (%s, %s, %s)",
+                (user_id, team_id or None, event_type),
+            )
+    except Exception as e:
+        logger.debug(f"[usage] record_usage_event failed: {e}")
+
+
+def get_hosted_usage_summary(user_id: str, team_id: str = "") -> dict | None:  # noqa: ARG001
+    """
+    Returns {event_type: count} for the current calendar month, or None if
+    not running in hosted/Postgres mode. Feeds get_status's HTTP response
+    (plan, memories stored, reads/writes this period).
+    """
+    from magnet.postgres_store import get_pool_if_configured
+
+    pool = get_pool_if_configured()
+    if pool is None:
+        return None
+    try:
+        with pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT event_type, COUNT(*) FROM usage_events
+                WHERE user_id = %s AND created_at >= date_trunc('month', now())
+                GROUP BY event_type
+                """,
+                (user_id,),
+            ).fetchall()
+        return {event_type: count for event_type, count in rows}
+    except Exception as e:
+        logger.debug(f"[usage] get_hosted_usage_summary failed: {e}")
+        return None

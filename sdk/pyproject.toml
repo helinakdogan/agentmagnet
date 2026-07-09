@@ -26,14 +26,16 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://agentmagnet.app"
-Repository = "https://github.com/helinakdogan/magnet-gateway"
+Repository = "https://github.com/helinakdogan/agentmagnet"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio"]
+postgres = ["psycopg[binary]>=3.1", "psycopg_pool>=3.2"]
 
 [project.scripts]
 agent-magnet = "magnet.cli:main"
 agent-magnet-mcp = "magnet.mcp_server:main"
+agent-magnet-http = "magnet.http_server:main"
 agent-magnet-hook = "magnet.hooks.save_session:main"
 
 [tool.setuptools.packages.find]
