@@ -35,6 +35,13 @@ TEAM_KEY_REQUIRED_MSG = (
     "Team memory requires an Agent Magnet key. Get one at agentmagnet.app."
 )
 
+# Plan gate — separate from key VALIDITY (auth.validate_key / the HTTP auth
+# middleware already reject unknown/inactive keys before any tool handler
+# runs). This is about what a *valid* key is allowed to do: a "free" key is
+# real and works fine for solo/local memory, but must never pass here.
+PAID_PLANS = frozenset({"team", "pro"})
+PLAN_REQUIRED_MSG = "Team memory is a paid feature. Upgrade at agentmagnet.app."
+
 _TEAM_ID_CHARS = string.ascii_lowercase + string.digits
 
 
@@ -299,6 +306,58 @@ def set_storage_mode(actor_user_id: str, team_id: str, mode: str, redis_url: str
     return get_team(team_id)
 
 
+# ── Plan gate ─────────────────────────────────────────────────────────────
+
+def get_active_plan(user_id: str) -> str | None:
+    """
+    Highest-value active plan this user_id currently holds, resolved FRESH
+    from Postgres (api_keys, not a cached/contextvar value) — so it reflects
+    the user's real paid status regardless of which of their own keys made
+    the current call. Returns None if the user has no active key at all, OR
+    if Postgres is unreachable — both cases must fail closed, so callers
+    treat None exactly like "not paid" (see PAID_PLANS checks below).
+    """
+    from magnet.postgres_store import get_pool_if_configured
+
+    pool = get_pool_if_configured()
+    if pool is None:
+        return None
+    try:
+        with pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT plan FROM api_keys WHERE user_id = %s AND active = true",
+                (user_id,),
+            ).fetchall()
+    except Exception as e:
+        logger.error(f"[team_permissions] plan lookup failed: {e}")
+        return None
+
+    plans = {r[0] for r in rows}
+    if "pro" in plans:
+        return "pro"
+    if "team" in plans:
+        return "team"
+    if plans:
+        return "free"
+    return None
+
+
+def has_paid_plan(user_id: str) -> bool:
+    return get_active_plan(user_id) in PAID_PLANS
+
+
+def team_permission_denied_message(user_id: str) -> str:
+    """Re-derives WHY a team operation was denied, so callers can show the
+    specific message instead of a generic catch-all: no valid hosted key at
+    all (or Postgres unreachable) vs. a real key with an insufficient plan."""
+    plan = get_active_plan(user_id)
+    if plan is None:
+        return TEAM_KEY_REQUIRED_MSG
+    if plan not in PAID_PLANS:
+        return PLAN_REQUIRED_MSG
+    return TEAM_KEY_REQUIRED_MSG  # defensive fallback — paid callers deny via team/membership, not plan
+
+
 # ── Permission gate — the actual moat ────────────────────────────────────────
 
 def check_team_permission(user_id: str, team_id: str, action: str = "read") -> dict | None:
@@ -306,8 +365,10 @@ def check_team_permission(user_id: str, team_id: str, action: str = "read") -> d
     THE gate every team-touching MCP tool call must pass before it's allowed
     to read/write anything. Returns the team dict (with `redis_url`
     decrypted if storage_mode == "byo") on success, or None on ANY denial —
-    no Postgres reachable (closes stdio/local mode unconditionally), team
-    doesn't exist, team isn't active, or user_id isn't a member.
+    no Postgres reachable (closes stdio/local mode unconditionally), the
+    caller's plan isn't "team" or "pro", team doesn't exist, team isn't
+    active, or user_id isn't a member. Callers that need to show WHY should
+    call team_permission_denied_message(user_id) when this returns None.
 
     On success, records exactly one usage_events row (the billable "sync
     request") — this is the single place that happens, so "one validated
@@ -320,6 +381,14 @@ def check_team_permission(user_id: str, team_id: str, action: str = "read") -> d
         # No hosted Postgres reachable — this is what makes team memory
         # impossible to run standalone from the open package. Every stdio/
         # local invocation lands here, always, by construction.
+        return None
+
+    if not has_paid_plan(user_id):
+        # A valid, active key is not enough — team memory is gated by PLAN.
+        # Deliberately independent of MAGNET_REDIS_URL: a BYO redis_url only
+        # ever decides WHERE a team's data lives (see _team_store_for /
+        # set_storage_mode), never WHETHER this user_id may touch team
+        # features at all.
         return None
 
     with pool.connection() as conn:

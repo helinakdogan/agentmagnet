@@ -1387,8 +1387,19 @@ async def _handle_mark_done(
 # shared between them. See team_permissions.py's module docstring.
 
 async def _handle_create_team(team_name: str) -> str:
-    from magnet.team_permissions import create_team, TEAM_KEY_REQUIRED_MSG
-    team = await asyncio.to_thread(create_team, _current_user_id(), team_name)
+    from magnet.team_permissions import (
+        create_team, has_paid_plan, team_permission_denied_message, TEAM_KEY_REQUIRED_MSG,
+    )
+    user = _current_user_id()
+    if not await asyncio.to_thread(has_paid_plan, user):
+        # NOTE: this gate is deliberately only here (the mg_sk_-key/MCP-tool
+        # path), not inside team_permissions.create_team() itself — that
+        # function is also called by the dashboard's Supabase-session
+        # "create a team" flow, which mints a user's very first team-plan
+        # key AT creation time and would be impossible to pass a
+        # pre-existing-paid-key check.
+        return await asyncio.to_thread(team_permission_denied_message, user)
+    team = await asyncio.to_thread(create_team, user, team_name)
     if team is None:
         return TEAM_KEY_REQUIRED_MSG
     team_id = team["id"]
@@ -1403,8 +1414,13 @@ async def _handle_create_team(team_name: str) -> str:
 
 
 async def _handle_join_team(team_id: str) -> str:
-    from magnet.team_permissions import join_team, TEAM_KEY_REQUIRED_MSG
-    team = await asyncio.to_thread(join_team, _current_user_id(), team_id)
+    from magnet.team_permissions import (
+        join_team, has_paid_plan, team_permission_denied_message, TEAM_KEY_REQUIRED_MSG,
+    )
+    user = _current_user_id()
+    if not await asyncio.to_thread(has_paid_plan, user):
+        return await asyncio.to_thread(team_permission_denied_message, user)
+    team = await asyncio.to_thread(join_team, user, team_id)
     if team is None:
         return TEAM_KEY_REQUIRED_MSG
     _get_usage_counter().record_team_write(team_id)
@@ -1416,9 +1432,12 @@ async def _handle_join_team(team_id: str) -> str:
 
 
 async def _handle_add_team_member(team_id: str, user_id: str) -> str:
-    from magnet.team_permissions import add_member
+    from magnet.team_permissions import add_member, has_paid_plan, team_permission_denied_message
+    actor = _current_user_id()
+    if not await asyncio.to_thread(has_paid_plan, actor):
+        return await asyncio.to_thread(team_permission_denied_message, actor)
     try:
-        ok, msg = await asyncio.to_thread(add_member, _current_user_id(), team_id, user_id)
+        ok, msg = await asyncio.to_thread(add_member, actor, team_id, user_id)
     except Exception as e:
         return f"Could not add member: {e}"
     if not ok:
@@ -1431,10 +1450,10 @@ async def _handle_list_team_members(team_id: str | None = None) -> str:
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
-    from magnet.team_permissions import check_team_permission, list_members, TEAM_KEY_REQUIRED_MSG
+    from magnet.team_permissions import check_team_permission, list_members, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
     team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "list_team_members")
     if team is None:
-        return TEAM_KEY_REQUIRED_MSG
+        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
     try:
         members = await asyncio.to_thread(list_members, tid)
     except Exception as e:
@@ -1462,10 +1481,10 @@ async def _handle_list_team_projects(team_id: str | None = None) -> str:
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
     team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "list_team_projects")
     if team is None:
-        return TEAM_KEY_REQUIRED_MSG
+        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
     ts = _team_store_for(team)
     try:
         shared_projects = await asyncio.to_thread(ts.list_shared_projects, tid)
@@ -1484,10 +1503,10 @@ async def _handle_share_project_to_team(
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
     team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "share_project_to_team")
     if team is None:
-        return TEAM_KEY_REQUIRED_MSG
+        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
     user, profile, project = _resolve_context(profile, project)
     store = _get_memory_store()
     items = await asyncio.to_thread(store.load, user, profile, project)
@@ -1515,10 +1534,10 @@ async def _handle_share_item_to_team(
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
     team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "share_item_to_team")
     if team is None:
-        return TEAM_KEY_REQUIRED_MSG
+        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
     user, profile, project = _resolve_context(profile, project)
     store = _get_memory_store()
     items = await asyncio.to_thread(store.load, user, profile, project)
@@ -1542,10 +1561,10 @@ async def _handle_get_team_memory(
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
     team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "get_team_memory")
     if team is None:
-        return TEAM_KEY_REQUIRED_MSG
+        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
 
     ts = _team_store_for(team)
     explicit_project = project is not None
@@ -1945,10 +1964,11 @@ async def _handle_get_status() -> str:
     team_line = "none (solo mode)"
     if _current_team_id():
         try:
-            from magnet.team_permissions import check_team_permission, list_members, TEAM_KEY_REQUIRED_MSG
+            from magnet.team_permissions import check_team_permission, list_members, team_permission_denied_message
             team = await asyncio.to_thread(check_team_permission, user, _current_team_id(), "get_status")
             if team is None:
-                team_line = f"{_current_team_id()} ({TEAM_KEY_REQUIRED_MSG})"
+                deny_msg = await asyncio.to_thread(team_permission_denied_message, user)
+                team_line = f"{_current_team_id()} ({deny_msg})"
             else:
                 ts = _team_store_for(team)
                 members = await asyncio.to_thread(list_members, _current_team_id())
@@ -2041,10 +2061,10 @@ async def _handle_usage_stats() -> dict:
 # ── Team handlers ─────────────────────────────────────────────────────────────
 
 async def _handle_get_team_profile(team_id: str, project_id: str) -> dict:
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
     team = await asyncio.to_thread(check_team_permission, _current_user_id(), team_id, "get_team_profile")
     if team is None:
-        return {"error": TEAM_KEY_REQUIRED_MSG}
+        return {"error": await asyncio.to_thread(team_permission_denied_message, _current_user_id())}
     # NOTE: this legacy preference-profile subsystem (TeamStore/memory._team_store,
     # distinct from MagnetTeamStore above) always uses the shared managed
     # backend — storage_mode/BYO selection is not wired into it. Permission
@@ -2075,10 +2095,10 @@ async def _handle_get_team_profile(team_id: str, project_id: str) -> dict:
 async def _handle_add_team_signal(
     team_id: str, project_id: str, messages: list[dict], signal_type: str
 ) -> dict:
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
     team = await asyncio.to_thread(check_team_permission, _current_user_id(), team_id, "add_team_signal")
     if team is None:
-        return {"error": TEAM_KEY_REQUIRED_MSG}
+        return {"error": await asyncio.to_thread(team_permission_denied_message, _current_user_id())}
     from magnet.team_store import TeamMemoryRequiresRedis
     memory = _get_memory()
     try:
