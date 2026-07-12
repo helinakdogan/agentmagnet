@@ -20,8 +20,6 @@ from __future__ import annotations
 import difflib
 import json
 import logging
-import random
-import string
 import time
 from typing import Any
 
@@ -414,20 +412,26 @@ class TeamStore:
         return reflector.build_injection(merged_profile)
 
 
-# ── MagnetTeamStore — new team memory (MemoryStore category format) ────────────
+# ── MagnetTeamStore — team DATA store (MemoryStore category format) ───────────
+#
+# Coordination (create/join/membership/permission) lives server-side ONLY, in
+# team_permissions.py (Postgres-backed) — that's the paid moat, and it cannot
+# run without reaching our hosted database. This class no longer has any
+# create_team/join_team/add_member/list_members/get_teams_for_user method: a
+# caller always arrives here already holding a team_id it has been granted
+# permission for (via team_permissions.check_team_permission()), and this
+# class's only job is reading/writing that team's shared project DATA —
+# against whichever backend the caller passes in (our shared backend for
+# "managed" teams, or a team's own Redis client for "byo" teams).
 #
 # Data model (all in Redis):
-#   team:{team_id}:meta      → {name, owner, created_at, plan}
-#   team:{team_id}:members   → {user_id: {role, joined_at}}
 #   team:{team_id}:projects  → [project_name, ...]
-#   team:member:{user_id}    → [team_id, ...]
 #   vmm:team:{team_id}:{project} → {items: [{id, category, text, status, shared_by, ...}]}
 #
 # This mirrors the solo vmm:{user}:{profile}:{project} format exactly,
 # so personal and team items can be merged and displayed uniformly.
 
-_TEAM_ID_CHARS = string.ascii_lowercase + string.digits
-_TEAM_META_TTL = 60 * 60 * 24 * 365   # 1 year
+_TEAM_META_TTL = 60 * 60 * 24 * 365   # 1 year (projects-list key)
 _TEAM_ITEM_TTL = 60 * 60 * 24 * 90    # 90 days (matches MemoryStore)
 _AUTO_PROMOTE_THRESHOLD = 0.60          # difflib ratio for "same idea"
 
@@ -438,19 +442,19 @@ TEAM_NEEDS_REDIS_MSG = (
 )
 
 
-def _team_gen_id() -> str:
-    return "team-" + "".join(random.choices(_TEAM_ID_CHARS, k=6))
-
-
 def _tn(s: str) -> str:
     return s.strip().lower()
 
 
 class MagnetTeamStore:
     """
-    Team memory store — new category-based format.
-    Requires Redis (raises TeamMemoryRequiresRedis on local-only mode).
-    Stores shared project items in vmm:team:{team_id}:{project}.
+    Team memory DATA store — new category-based format. Requires a real
+    Redis-shaped backend (raises TeamMemoryRequiresRedis on local-only
+    SQLite). Stores shared project items in vmm:team:{team_id}:{project}.
+
+    Does NOT decide whether the caller is allowed to touch team_id — that's
+    team_permissions.check_team_permission()'s job, server-side, before this
+    class is ever instantiated for a given call.
     """
 
     def __init__(self, redis_client: Any | None) -> None:
@@ -463,85 +467,12 @@ class MagnetTeamStore:
     # ── Key helpers ────────────────────────────────────────────────────
 
     @staticmethod
-    def _meta_key(team_id: str) -> str:
-        return f"team:{team_id}:meta"
-
-    @staticmethod
-    def _members_key(team_id: str) -> str:
-        return f"team:{team_id}:members"
-
-    @staticmethod
     def _projects_key(team_id: str) -> str:
         return f"team:{team_id}:projects"
 
     @staticmethod
-    def _user_teams_key(user_id: str) -> str:
-        return f"team:member:{_tn(user_id)}"
-
-    @staticmethod
     def _project_key(team_id: str, project: str) -> str:
         return f"vmm:team:{team_id}:{_tn(project)}"
-
-    # ── Team lifecycle ─────────────────────────────────────────────────
-
-    def create_team(self, name: str, owner: str) -> str:
-        """Create a team, set owner as first member. Returns new team_id."""
-        self._require_redis()
-        team_id = _team_gen_id()
-        meta = {"name": name, "owner": owner, "created_at": time.time(), "plan": "pro_beta"}
-        self._redis.setex(self._meta_key(team_id), _TEAM_META_TTL, json.dumps(meta, ensure_ascii=False))
-        members: dict = {owner: {"role": "owner", "joined_at": time.time()}}
-        self._redis.setex(self._members_key(team_id), _TEAM_META_TTL, json.dumps(members, ensure_ascii=False))
-        self._redis.setex(self._projects_key(team_id), _TEAM_META_TTL, json.dumps([]))
-        self._register_user_team(owner, team_id)
-        logger.info(f"[team] created '{name}' ({team_id}) — owner: {owner}")
-        return team_id
-
-    def get_team_meta(self, team_id: str) -> dict | None:
-        self._require_redis()
-        raw = self._redis.get(self._meta_key(team_id))
-        return json.loads(raw) if raw else None
-
-    def join_team(self, team_id: str, user_id: str) -> bool:
-        """User joins a team by id. Returns False if team doesn't exist."""
-        self._require_redis()
-        if not self.get_team_meta(team_id):
-            return False
-        members = self._get_members_dict(team_id)
-        if user_id not in members:
-            members[user_id] = {"role": "member", "joined_at": time.time()}
-            self._redis.setex(self._members_key(team_id), _TEAM_META_TTL, json.dumps(members, ensure_ascii=False))
-            self._register_user_team(user_id, team_id)
-        return True
-
-    def add_member(self, team_id: str, requester_id: str, user_id_to_add: str) -> tuple[bool, str]:
-        """Owner adds a member. Returns (success, message)."""
-        self._require_redis()
-        members = self._get_members_dict(team_id)
-        if members.get(requester_id, {}).get("role") != "owner":
-            return False, "Only the team owner can add members directly. Share your team_id instead."
-        if user_id_to_add in members:
-            return True, f"'{user_id_to_add}' is already a member."
-        members[user_id_to_add] = {"role": "member", "joined_at": time.time()}
-        self._redis.setex(self._members_key(team_id), _TEAM_META_TTL, json.dumps(members, ensure_ascii=False))
-        self._register_user_team(user_id_to_add, team_id)
-        return True, f"'{user_id_to_add}' added to the team."
-
-    def list_members(self, team_id: str) -> list[dict]:
-        """Return list of {user_id, role, joined_at}."""
-        self._require_redis()
-        members = self._get_members_dict(team_id)
-        return sorted(
-            [{"user_id": uid, **info} for uid, info in members.items()],
-            key=lambda m: m.get("joined_at", 0),
-        )
-
-    def get_teams_for_user(self, user_id: str) -> list[str]:
-        try:
-            self._require_redis()
-            return self._get_user_teams(user_id)
-        except TeamMemoryRequiresRedis:
-            return []
 
     def is_project_shared(self, team_id: str, project: str) -> bool:
         """True if this project has been shared into the team's shared space."""
@@ -729,20 +660,6 @@ class MagnetTeamStore:
         return "\n".join(lines)
 
     # ── Internal helpers ───────────────────────────────────────────────
-
-    def _get_members_dict(self, team_id: str) -> dict:
-        raw = self._redis.get(self._members_key(team_id))
-        return json.loads(raw) if raw else {}
-
-    def _get_user_teams(self, user_id: str) -> list[str]:
-        raw = self._redis.get(self._user_teams_key(user_id))
-        return json.loads(raw) if raw else []
-
-    def _register_user_team(self, user_id: str, team_id: str) -> None:
-        teams = self._get_user_teams(user_id)
-        if team_id not in teams:
-            teams.append(team_id)
-            self._redis.setex(self._user_teams_key(user_id), _TEAM_META_TTL, json.dumps(teams))
 
     def _register_shared_project(self, team_id: str, project: str) -> None:
         raw = self._redis.get(self._projects_key(team_id))

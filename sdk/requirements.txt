@@ -6,6 +6,7 @@ uvicorn
 requests
 supabase
 PyJWT[crypto]>=2.8
+cryptography>=42.0
 numpy
 qdrant-client>=1.7.0
 neo4j>=5.14.0

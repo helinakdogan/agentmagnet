@@ -308,7 +308,8 @@ def _get_compressor() -> Any:
 
 
 def _get_team_store() -> Any:
-    """MagnetTeamStore — category-based team memory. Requires Redis."""
+    """MagnetTeamStore — category-based team memory, "managed" storage_mode.
+    Requires Redis/Postgres-backed shared backend."""
     global _team_store
     if _team_store is None:
         from magnet.team_store import MagnetTeamStore
@@ -316,12 +317,34 @@ def _get_team_store() -> Any:
     return _team_store
 
 
+def _team_store_for(team: dict) -> Any:
+    """Pick the right MagnetTeamStore backend for a team's storage_mode.
+    'managed' reuses the shared process-wide backend singleton (same one
+    personal memory uses); 'byo' opens a connection to the team's own
+    (already-decrypted) redis_url. `team` must be a dict already returned by
+    team_permissions.check_team_permission()/join_team()/create_team() — this
+    function never itself decides whether the caller is allowed to be here.
+    """
+    if team.get("storage_mode") == "byo" and team.get("redis_url"):
+        from magnet.team_store import MagnetTeamStore
+        import redis as redis_lib
+        return MagnetTeamStore(redis_client=redis_lib.from_url(team["redis_url"], decode_responses=True))
+    return _get_team_store()
+
+
 async def _load_team_items_if_shared(project: str, team_id: str) -> list[dict]:
-    """Load team items for project if it's shared; returns [] if not shared or no Redis."""
+    """Load team items for project if it's shared; returns [] if not shared,
+    permission denied, or no hosted Postgres reachable. Runs on every recall
+    when a team_id is active, so a denial here must never surface as an
+    error — only ever silently fall back to personal-only memory."""
     if not team_id:
         return []
     try:
-        ts = _get_team_store()
+        from magnet.team_permissions import check_team_permission
+        team = await asyncio.to_thread(check_team_permission, _current_user_id(), team_id, "recall")
+        if team is None:
+            return []
+        ts = _team_store_for(team)
         if await asyncio.to_thread(ts.is_project_shared, team_id, project):
             return await asyncio.to_thread(ts.load_team_items, team_id, project)
     except Exception as e:
@@ -1005,10 +1028,22 @@ async def list_tools() -> list[types.Tool]:
 
 # ── Tool dispatch ─────────────────────────────────────────────────────────────
 
+# Team tools record their own usage_events row — but ONLY on a successful
+# team_permissions.check_team_permission() (see that module) — never here,
+# unconditionally, before the handler even runs. A denied team call must not
+# count as a billable "sync request"; that's the whole point of gating it at
+# the permission layer instead of the dispatch layer.
+_TEAM_TOOL_NAMES = frozenset({
+    "create_team", "join_team", "add_team_member", "list_team_members",
+    "list_team_projects", "share_project_to_team", "share_item_to_team",
+    "get_team_memory", "get_team_profile", "add_team_signal",
+})
+
+
 def _record_usage_event(tool_name: str) -> None:
-    """Fires on every tool call, both transports. No-op outside hosted/
-    Postgres mode (record_usage_event itself checks). Wrapped so metering
-    can never break a tool response."""
+    """Fires on every non-team tool call, both transports. No-op outside
+    hosted/Postgres mode (record_usage_event itself checks). Wrapped so
+    metering can never break a tool response."""
     try:
         from magnet.usage_counter import record_usage_event
         record_usage_event(_current_user_id(), _current_team_id(), tool_name)
@@ -1018,7 +1053,8 @@ def _record_usage_event(tool_name: str) -> None:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-    _record_usage_event(name)
+    if name not in _TEAM_TOOL_NAMES:
+        _record_usage_event(name)
     try:
         if name == "recall" or name == "inject_memory":
             result = await _handle_recall(
@@ -1343,70 +1379,46 @@ async def _handle_mark_done(
 
 
 # ── Team handlers ─────────────────────────────────────────────────────────────
-
-def _require_redis_for_team() -> str | None:
-    """Return error message if Redis is not available; None if ok."""
-    if not os.environ.get("MAGNET_REDIS_URL"):
-        return (
-            "Team memory needs shared storage. "
-            "You and your teammates must all set the same MAGNET_REDIS_URL. "
-            "This is a Pro feature — see agentmagnet.app."
-        )
-    return None
-
+#
+# Every handler below calls into team_permissions.py FIRST — the Postgres-
+# only, server-side module that owns team coordination/permission. None of
+# these handlers can succeed without a hosted key reaching our Postgres;
+# that's true in both stdio and HTTP transports, since this dispatch code is
+# shared between them. See team_permissions.py's module docstring.
 
 async def _handle_create_team(team_name: str) -> str:
-    err = _require_redis_for_team()
-    if err:
-        return err
-    from magnet.tier import check_team_feature
-    allowed, plan_label = check_team_feature()
-    if not allowed:
-        return "Team memory is a Pro feature. See agentmagnet.app."
-    # Beta: always allowed — log gate for future billing
-    ts = _get_team_store()
-    try:
-        team_id = await asyncio.to_thread(ts.create_team, team_name, _current_user_id())
-    except Exception as e:
-        return f"Could not create team: {e}"
+    from magnet.team_permissions import create_team, TEAM_KEY_REQUIRED_MSG
+    team = await asyncio.to_thread(create_team, _current_user_id(), team_name)
+    if team is None:
+        return TEAM_KEY_REQUIRED_MSG
+    team_id = team["id"]
     _get_usage_counter().record_team_write(team_id)
     return (
         f"Team '{team_name}' created! Your team id: {team_id}\n\n"
         f"Share this id with your teammates — they run:\n"
         f"  *team join {team_id}\n\n"
         f"Then they add MAGNET_TEAM_ID={team_id} to their MCP config and restart. "
-        f"[{plan_label}]"
+        f"[{team['plan']}]"
     )
 
 
 async def _handle_join_team(team_id: str) -> str:
-    err = _require_redis_for_team()
-    if err:
-        return err
-    ts = _get_team_store()
-    try:
-        ok = await asyncio.to_thread(ts.join_team, team_id, _current_user_id())
-    except Exception as e:
-        return f"Could not join team: {e}"
-    if not ok:
-        return f"Team '{team_id}' not found. Check the team_id with the owner."
+    from magnet.team_permissions import join_team, TEAM_KEY_REQUIRED_MSG
+    team = await asyncio.to_thread(join_team, _current_user_id(), team_id)
+    if team is None:
+        return TEAM_KEY_REQUIRED_MSG
     _get_usage_counter().record_team_write(team_id)
-    meta = await asyncio.to_thread(ts.get_team_meta, team_id)
-    team_name = (meta or {}).get("name", team_id)
     return (
-        f"Joined team '{team_name}' ({team_id}).\n\n"
+        f"Joined team '{team['name']}' ({team_id}).\n\n"
         f"Add MAGNET_TEAM_ID={team_id} to your MCP config env and restart Claude. "
         f"Then your recalls and recaps will include shared team memory."
     )
 
 
 async def _handle_add_team_member(team_id: str, user_id: str) -> str:
-    err = _require_redis_for_team()
-    if err:
-        return err
-    ts = _get_team_store()
+    from magnet.team_permissions import add_member
     try:
-        ok, msg = await asyncio.to_thread(ts.add_member, team_id, _current_user_id(), user_id)
+        ok, msg = await asyncio.to_thread(add_member, _current_user_id(), team_id, user_id)
     except Exception as e:
         return f"Could not add member: {e}"
     if not ok:
@@ -1419,18 +1431,15 @@ async def _handle_list_team_members(team_id: str | None = None) -> str:
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
-    err = _require_redis_for_team()
-    if err:
-        return err
-    ts = _get_team_store()
+    from magnet.team_permissions import check_team_permission, list_members, TEAM_KEY_REQUIRED_MSG
+    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "list_team_members")
+    if team is None:
+        return TEAM_KEY_REQUIRED_MSG
     try:
-        meta = await asyncio.to_thread(ts.get_team_meta, tid)
-        members = await asyncio.to_thread(ts.list_members, tid)
+        members = await asyncio.to_thread(list_members, tid)
     except Exception as e:
         return f"Could not list members: {e}"
-    if meta is None:
-        return f"Team '{tid}' not found."
-    lines = [f"Team: {meta.get('name', tid)} ({tid})", ""]
+    lines = [f"Team: {team.get('name', tid)} ({tid})", ""]
     for m in members:
         role_tag = " (owner)" if m["role"] == "owner" else ""
         lines.append(f"  · {m['user_id']}{role_tag}")
@@ -1453,10 +1462,11 @@ async def _handle_list_team_projects(team_id: str | None = None) -> str:
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
-    err = _require_redis_for_team()
-    if err:
-        return err
-    ts = _get_team_store()
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "list_team_projects")
+    if team is None:
+        return TEAM_KEY_REQUIRED_MSG
+    ts = _team_store_for(team)
     try:
         shared_projects = await asyncio.to_thread(ts.list_shared_projects, tid)
     except Exception as e:
@@ -1474,15 +1484,16 @@ async def _handle_share_project_to_team(
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    err = _require_redis_for_team()
-    if err:
-        return err
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "share_project_to_team")
+    if team is None:
+        return TEAM_KEY_REQUIRED_MSG
     user, profile, project = _resolve_context(profile, project)
     store = _get_memory_store()
     items = await asyncio.to_thread(store.load, user, profile, project)
     if not items:
         return f"No memory in {profile} / {project} to share yet."
-    ts = _get_team_store()
+    ts = _team_store_for(team)
     try:
         result = await asyncio.to_thread(ts.share_project, user, project, tid, items)
     except Exception as e:
@@ -1504,13 +1515,14 @@ async def _handle_share_item_to_team(
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    err = _require_redis_for_team()
-    if err:
-        return err
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "share_item_to_team")
+    if team is None:
+        return TEAM_KEY_REQUIRED_MSG
     user, profile, project = _resolve_context(profile, project)
     store = _get_memory_store()
     items = await asyncio.to_thread(store.load, user, profile, project)
-    ts = _get_team_store()
+    ts = _team_store_for(team)
     try:
         result = await asyncio.to_thread(ts.share_item, tid, project, item_id, user, items)
     except Exception as e:
@@ -1530,11 +1542,12 @@ async def _handle_get_team_memory(
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    err = _require_redis_for_team()
-    if err:
-        return err
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "get_team_memory")
+    if team is None:
+        return TEAM_KEY_REQUIRED_MSG
 
-    ts = _get_team_store()
+    ts = _team_store_for(team)
     explicit_project = project is not None
     _, profile, resolved_project = _resolve_context(None, project)
 
@@ -1932,17 +1945,18 @@ async def _handle_get_status() -> str:
     team_line = "none (solo mode)"
     if _current_team_id():
         try:
-            from magnet.tier import check_team_feature
-            _, plan_label = check_team_feature(_current_team_id())
-            ts = _get_team_store()
-            members = await asyncio.to_thread(ts.list_members, _current_team_id())
-            meta = await asyncio.to_thread(ts.get_team_meta, _current_team_id())
-            team_name = (meta or {}).get("name", _current_team_id())
-            shared = await asyncio.to_thread(ts.is_project_shared, _current_team_id(), project)
-            shared_tag = " · project shared ✓" if shared else " · project not yet shared"
-            team_line = f"{team_name} ({len(members)} member{'s' if len(members) != 1 else ''}) · {plan_label}{shared_tag}"
+            from magnet.team_permissions import check_team_permission, list_members, TEAM_KEY_REQUIRED_MSG
+            team = await asyncio.to_thread(check_team_permission, user, _current_team_id(), "get_status")
+            if team is None:
+                team_line = f"{_current_team_id()} ({TEAM_KEY_REQUIRED_MSG})"
+            else:
+                ts = _team_store_for(team)
+                members = await asyncio.to_thread(list_members, _current_team_id())
+                shared = await asyncio.to_thread(ts.is_project_shared, _current_team_id(), project)
+                shared_tag = " · project shared ✓" if shared else " · project not yet shared"
+                team_line = f"{team['name']} ({len(members)} member{'s' if len(members) != 1 else ''}) · {team['plan']}{shared_tag}"
         except Exception as e:
-            team_line = f"{_current_team_id()} (needs Redis to show details)"
+            team_line = f"{_current_team_id()} (error checking team status: {e})"
 
     lines = [
         f"Active:          {profile} / {project}",
@@ -2027,9 +2041,14 @@ async def _handle_usage_stats() -> dict:
 # ── Team handlers ─────────────────────────────────────────────────────────────
 
 async def _handle_get_team_profile(team_id: str, project_id: str) -> dict:
-    from magnet.tier import check_premium_feature, premium_required_response
-    if not check_premium_feature("team_memory"):
-        return premium_required_response()
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    team = await asyncio.to_thread(check_team_permission, _current_user_id(), team_id, "get_team_profile")
+    if team is None:
+        return {"error": TEAM_KEY_REQUIRED_MSG}
+    # NOTE: this legacy preference-profile subsystem (TeamStore/memory._team_store,
+    # distinct from MagnetTeamStore above) always uses the shared managed
+    # backend — storage_mode/BYO selection is not wired into it. Permission
+    # is enforced the same way as everywhere else; data location is not.
     from magnet.team_store import TeamMemoryRequiresRedis
     memory = _get_memory()
     try:
@@ -2056,9 +2075,10 @@ async def _handle_get_team_profile(team_id: str, project_id: str) -> dict:
 async def _handle_add_team_signal(
     team_id: str, project_id: str, messages: list[dict], signal_type: str
 ) -> dict:
-    from magnet.tier import check_premium_feature, premium_required_response
-    if not check_premium_feature("team_memory"):
-        return premium_required_response()
+    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG
+    team = await asyncio.to_thread(check_team_permission, _current_user_id(), team_id, "add_team_signal")
+    if team is None:
+        return {"error": TEAM_KEY_REQUIRED_MSG}
     from magnet.team_store import TeamMemoryRequiresRedis
     memory = _get_memory()
     try:

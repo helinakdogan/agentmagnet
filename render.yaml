@@ -16,5 +16,7 @@ services:
         sync: false
       - key: MAGNET_CORS_ORIGINS
         sync: false
+      - key: MAGNET_ENCRYPTION_KEY
+        sync: false
       - key: PORT
         value: "8000"

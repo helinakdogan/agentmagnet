@@ -23,6 +23,7 @@ dependencies = [
     "python-dotenv",
     "sentence-transformers>=2.2",
     "PyJWT[crypto]>=2.8",
+    "cryptography>=42.0",
 ]
 
 [project.urls]

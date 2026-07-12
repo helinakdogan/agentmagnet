@@ -346,6 +346,109 @@ async def delete_memory_item(request) -> JSONResponse:
     return JSONResponse({"error": "not_found", "message": "Memory item not found."}, status_code=404)
 
 
+# ── Team dashboard routes ───────────────────────────────────────────────────
+#
+# Thin wrappers over team_permissions.py — the actual coordination/moat logic
+# lives there (Postgres-only), not here. Same Supabase-session auth as the
+# routes above.
+
+async def create_team_route(request) -> JSONResponse:
+    user_id = await _require_user(request)
+    if isinstance(user_id, JSONResponse):
+        return user_id
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    name = (body.get("name") or "").strip() or "My Team"
+
+    from magnet.team_permissions import create_team
+
+    team = create_team(user_id, name)
+    if team is None:
+        return JSONResponse({"error": "unavailable", "message": "Postgres is not configured."}, status_code=503)
+
+    # "Create team -> gives a team room id + shows the key" — one dashboard
+    # action mints the room AND a key scoped to it, same one-time-reveal
+    # convention as POST /api/keys.
+    from magnet.postgres_store import get_pool_if_configured
+
+    pool = get_pool_if_configured()
+    raw_key = "mg_sk_live_" + secrets.token_hex(32)
+    key_hash = _hash_key(raw_key)
+    masked = f"mg_sk_live_{raw_key[11:15]}...{raw_key[-4:]}"
+    key_name = f"{name} (team key)"
+
+    with pool.connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO api_keys (key_hash, user_id, team_id, name, masked_key, plan, active)
+            VALUES (%s, %s, %s, %s, %s, 'team', true)
+            RETURNING id, created_at
+            """,
+            (key_hash, user_id, team["id"], key_name, masked),
+        ).fetchone()
+
+    key_id, created_at = row
+    return JSONResponse({
+        "team": team,
+        "rawKey": raw_key,
+        "key": {"id": str(key_id), "name": key_name, "masked": masked, "created_at": created_at.isoformat()},
+    })
+
+
+async def list_teams_route(request) -> JSONResponse:
+    user_id = await _require_user(request)
+    if isinstance(user_id, JSONResponse):
+        return user_id
+
+    from magnet.team_permissions import get_teams_for_user, get_team_sync_usage
+
+    teams = get_teams_for_user(user_id)
+    for team in teams:
+        team["sync_requests_this_period"] = get_team_sync_usage(team["id"])
+        team.pop("redis_url", None)  # never sent to the client, even if populated
+    return JSONResponse({"teams": teams})
+
+
+async def update_team_storage_route(request) -> JSONResponse:
+    user_id = await _require_user(request)
+    if isinstance(user_id, JSONResponse):
+        return user_id
+
+    team_id = request.path_params["team_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    mode = body.get("storage_mode")
+    redis_url = body.get("redis_url")
+
+    if mode not in ("managed", "byo"):
+        return JSONResponse(
+            {"error": "bad_request", "message": "storage_mode must be 'managed' or 'byo'."},
+            status_code=400,
+        )
+
+    from magnet.team_permissions import set_storage_mode
+
+    team = set_storage_mode(user_id, team_id, mode, redis_url)
+    if team is None:
+        return JSONResponse(
+            {
+                "error": "denied",
+                "message": (
+                    "Not the team owner, team not found, the Redis URL couldn't be "
+                    "reached, or server-side encryption isn't configured."
+                ),
+            },
+            status_code=400,
+        )
+    team.pop("redis_url", None)
+    return JSONResponse({"team": team})
+
+
 def _lifespan(app: Starlette):
     return session_manager.run()
 
@@ -378,12 +481,15 @@ def build_app() -> Starlette:
             Route("/api/usage", get_usage, methods=["GET"]),
             Route("/api/memory", get_memory, methods=["GET"]),
             Route("/api/memory/{item_id}", delete_memory_item, methods=["DELETE"]),
+            Route("/api/teams", list_teams_route, methods=["GET"]),
+            Route("/api/teams", create_team_route, methods=["POST"]),
+            Route("/api/teams/{team_id}/storage", update_team_storage_route, methods=["PATCH"]),
         ],
         middleware=[
             Middleware(
                 CORSMiddleware,
                 allow_origins=origins,
-                allow_methods=["GET", "POST", "DELETE"],
+                allow_methods=["GET", "POST", "DELETE", "PATCH"],
                 allow_headers=["authorization", "content-type"],
             ),
         ],
