@@ -18,5 +18,7 @@ services:
         sync: false
       - key: MAGNET_ENCRYPTION_KEY
         sync: false
+      - key: MAGNET_MCP_RESOURCE
+        value: "https://mcp.agentmagnet.app"
       - key: PORT
         value: "8000"

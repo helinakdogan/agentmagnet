@@ -14,6 +14,7 @@ New console script: agent-magnet-http = "magnet.http_server:main"
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import secrets
@@ -33,7 +34,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from magnet.mcp_server import app as mcp_app
 from magnet.mcp_server import _set_current_identity, _reset_current_identity
 from magnet.mcp_server import _get_memory_store, _get_team_store
-from magnet.auth import validate_key, verify_supabase_jwt, _hash_key
+from magnet.auth import validate_key, verify_supabase_jwt, verify_mcp_oauth_token, _hash_key
 from magnet.usage_counter import check_usage_limit
 
 logger = logging.getLogger(__name__)
@@ -90,15 +91,43 @@ _RATE_LIMIT_RESPONSE = JSONResponse(
 )
 
 
+def _protected_resource_metadata_url() -> str:
+    resource = os.environ.get("MAGNET_MCP_RESOURCE", "https://mcp.agentmagnet.app").rstrip("/")
+    return f"{resource}/.well-known/oauth-protected-resource"
+
+
+def _unauthorized(message: str) -> JSONResponse:
+    """401 with the RFC 9728-mandated WWW-Authenticate challenge — this
+    header is literally what tells an MCP client (Claude) "this server
+    wants OAuth, here's where to learn how" and triggers it to start the
+    authorization flow instead of just giving up."""
+    return JSONResponse(
+        {"error": "unauthorized", "message": message},
+        status_code=401,
+        headers={"WWW-Authenticate": f'Bearer resource_metadata="{_protected_resource_metadata_url()}"'},
+    )
+
+
 class MagnetAuthASGIMiddleware:
     """
     Raw ASGI middleware (not Starlette's BaseHTTPMiddleware — that buffers
     the whole response body, which breaks Streamable HTTP's streaming
     responses). Wraps session_manager.handle_request directly.
 
-    Identity over HTTP comes ONLY from here — the validated API key. A
-    user_id/team_id in the request body is never read or trusted anywhere
-    in mcp_server.py's tool dispatch.
+    Accepts TWO credential types on the same Bearer header, tried in order:
+      1. mg_sk_... static API key (validate_key) — Codex/Cursor and anything
+         else that can set a custom header. Unchanged from before.
+      2. Anything else is tried as an OAuth 2.1 access token issued by
+         Supabase's OAuth Server (verify_mcp_oauth_token) — this is the path
+         Claude Desktop/web use, since they only accept a URL for a custom
+         connector (no header field) and drive the OAuth flow themselves
+         after seeing the 401 + WWW-Authenticate challenge below.
+
+    Either way, identity over HTTP comes ONLY from here — the validated
+    credential. A user_id/team_id in the request body is never read or
+    trusted anywhere in mcp_server.py's tool dispatch. An OAuth-authenticated
+    request always resolves to team_id="" (personal identity) and
+    key_id=None — team access still goes through a type=team mg_sk_ key.
     """
 
     def __init__(self, app) -> None:
@@ -113,30 +142,35 @@ class MagnetAuthASGIMiddleware:
         auth_header = headers.get(b"authorization", b"").decode("latin-1")
 
         if not auth_header.startswith("Bearer "):
-            await JSONResponse(
-                {"error": "unauthorized", "message": "Missing 'Authorization: Bearer mg_sk_...' header."},
-                status_code=401,
-            )(scope, receive, send)
+            await _unauthorized("Missing 'Authorization: Bearer ...' header.")(scope, receive, send)
             return
 
-        raw_key = auth_header[len("Bearer "):].strip()
-        identity = validate_key(raw_key)
-        if identity is None or not identity.get("active"):
-            await JSONResponse(
-                {"error": "unauthorized", "message": "Invalid, unknown, or inactive API key."},
-                status_code=401,
-            )(scope, receive, send)
-            return
+        raw = auth_header[len("Bearer "):].strip()
 
-        if not _check_rate_limit(_hash_key(raw_key)):
+        if raw.startswith("mg_sk_"):
+            identity = validate_key(raw)
+            if identity is None or not identity.get("active"):
+                await _unauthorized("Invalid, unknown, or inactive API key.")(scope, receive, send)
+                return
+            rate_key = _hash_key(raw)
+            user_id, team_id, key_id = identity["user_id"], identity["team_id"], identity.get("key_id")
+        else:
+            oauth_identity = verify_mcp_oauth_token(raw)
+            if oauth_identity is None:
+                await _unauthorized("Invalid, expired, or wrongly-scoped access token.")(scope, receive, send)
+                return
+            rate_key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            user_id, team_id, key_id = oauth_identity["user_id"], "", None
+
+        if not _check_rate_limit(rate_key):
             await _RATE_LIMIT_RESPONSE(scope, receive, send)
             return
 
         # Never trust anything from the request body — only the resolved
-        # identity from the validated key.
-        tokens = _set_current_identity(identity["user_id"], identity["team_id"], identity.get("key_id"))
+        # identity from the validated credential.
+        tokens = _set_current_identity(user_id, team_id, key_id)
         try:
-            allowed = check_usage_limit(identity["user_id"], identity["team_id"])
+            allowed = check_usage_limit(user_id, team_id)
             if not allowed:
                 await JSONResponse(
                     {"error": "quota_exceeded", "message": "Usage limit reached for this plan."},
@@ -172,6 +206,65 @@ async def health(request) -> JSONResponse:
         "package_version": package_version,
         "git_commit": os.environ.get("RENDER_GIT_COMMIT"),
     })
+
+
+# ── OAuth 2.1 discovery (RFC 9728 protected-resource metadata + AS metadata
+# passthrough) — unauthenticated, public. This is how Claude (or any MCP
+# client) discovers that /mcp requires OAuth and where to run the flow.
+# Supabase's OAuth Server (Authentication > OAuth Server in the dashboard)
+# IS the authorization server — we never issue or validate our own tokens
+# from scratch, only point at Supabase's and verify what it issues (see
+# auth.verify_mcp_oauth_token). ──────────────────────────────────────────
+
+async def oauth_protected_resource_metadata(request) -> JSONResponse:
+    resource = os.environ.get("MAGNET_MCP_RESOURCE", "https://mcp.agentmagnet.app").rstrip("/")
+    project_url = os.environ.get("SUPABASE_PROJECT_URL", "").rstrip("/")
+    return JSONResponse({
+        "resource": f"{resource}/mcp",
+        "authorization_servers": [f"{project_url}/auth/v1"] if project_url else [],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": ["openid", "email", "profile"],
+    })
+
+
+_as_metadata_cache: dict = {"body": None, "expires": 0.0}
+_AS_METADATA_CACHE_TTL = 300  # seconds — this document changes essentially never
+
+
+async def oauth_authorization_server_metadata(request) -> JSONResponse:
+    """Passthrough of Supabase's own AS metadata document, served from OUR
+    domain too. Per spec, clients are supposed to follow the
+    authorization_servers array from the protected-resource metadata above
+    and fetch discovery straight from Supabase — this route exists purely
+    as a compatibility fallback for MCP client versions that probe the
+    resource server's own /.well-known/oauth-authorization-server first."""
+    now = time.time()
+    if _as_metadata_cache["body"] is not None and _as_metadata_cache["expires"] > now:
+        return JSONResponse(_as_metadata_cache["body"])
+
+    project_url = os.environ.get("SUPABASE_PROJECT_URL", "").rstrip("/")
+    if not project_url:
+        return JSONResponse(
+            {"error": "unavailable", "message": "SUPABASE_PROJECT_URL is not configured."},
+            status_code=503,
+        )
+
+    import requests
+
+    try:
+        resp = requests.get(f"{project_url}/.well-known/oauth-authorization-server/auth/v1", timeout=5)
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception as e:
+        logger.error(f"[oauth] failed to fetch Supabase AS metadata: {type(e).__name__}: {e}")
+        return JSONResponse(
+            {"error": "unavailable", "message": "Could not reach the authorization server."},
+            status_code=503,
+        )
+
+    _as_metadata_cache["body"] = body
+    _as_metadata_cache["expires"] = now + _AS_METADATA_CACHE_TTL
+    return JSONResponse(body)
 
 
 # ── Dashboard API — Supabase-session-authenticated, distinct from the
@@ -762,6 +855,8 @@ def build_app() -> Starlette:
     return Starlette(
         routes=[
             Route("/health", health, methods=["GET"]),
+            Route("/.well-known/oauth-protected-resource", oauth_protected_resource_metadata, methods=["GET"]),
+            Route("/.well-known/oauth-authorization-server", oauth_authorization_server_metadata, methods=["GET"]),
             Route("/mcp", endpoint=mcp_endpoint, methods=["GET", "POST", "DELETE"]),
             Route("/api/keys", list_keys, methods=["GET"]),
             Route("/api/keys", create_key, methods=["POST"]),
