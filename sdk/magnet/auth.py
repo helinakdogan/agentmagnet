@@ -255,9 +255,16 @@ def verify_mcp_oauth_token(token: str) -> dict | None:
     mg_sk_... static key validated by validate_key() above.
 
     Same HS256/JWKS verification as verify_supabase_jwt, but with one hard
-    difference: aud must equal MAGNET_MCP_RESOURCE, not the generic
-    "authenticated" every regular Supabase session token carries. A
-    Custom Access Token Hook installed in the Supabase project (see
+    difference: aud must equal the full resource identifier
+    ({MAGNET_MCP_RESOURCE}/mcp) — the EXACT SAME value advertised as the
+    "resource" field in GET /.well-known/oauth-protected-resource — not the
+    generic "authenticated" every regular Supabase session token carries.
+    (These two MUST stay byte-identical: a spec-compliant client requests a
+    token scoped to the resource value it discovered from that metadata
+    endpoint, then may itself verify the returned token's aud matches what
+    it asked for — if our hook's aud and our metadata's resource ever
+    drift apart, the client rejects the token before it even reaches us.)
+    A Custom Access Token Hook installed in the Supabase project (see
     supabase_oauth_hook.sql at the repo root) sets that custom aud only on
     tokens carrying a client_id claim — i.e. only on OAuth-issued tokens,
     never on regular login sessions. That's what makes this genuinely
@@ -275,6 +282,8 @@ def verify_mcp_oauth_token(token: str) -> dict | None:
     if not token:
         return None
 
+    expected_audience = f"{resource.rstrip('/')}/mcp"
+
     import jwt
 
     try:
@@ -287,9 +296,9 @@ def verify_mcp_oauth_token(token: str) -> dict | None:
     logger.debug(f"[auth] oauth token header: alg={alg!r} kid={header.get('kid')!r}")
 
     if alg == "HS256":
-        payload = _verify_hs256(token, expected_audience=resource)
+        payload = _verify_hs256(token, expected_audience=expected_audience)
     elif alg in ("RS256", "ES256"):
-        payload = _verify_jwks(token, expected_audience=resource)
+        payload = _verify_jwks(token, expected_audience=expected_audience)
     else:
         logger.warning(f"[auth] oauth token verification FAILED: unsupported alg {alg!r}")
         return None
