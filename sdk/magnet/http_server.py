@@ -18,6 +18,7 @@ import logging
 import os
 import secrets
 import sys
+import time
 from datetime import datetime, timezone
 
 from starlette.applications import Starlette
@@ -43,6 +44,49 @@ session_manager = StreamableHTTPSessionManager(
                            # easier behind hosted infra (proxies/LBs) and for curl testing
     stateless=True,        # no server-side session affinity — safe behind a
                            # horizontally-scaled Render web service
+)
+
+
+# ── Rate limiter — Part 1 of the hard usage limits ──────────────────────────
+#
+# In-memory, per-process, fixed 60-second-bucket counter — same pattern as
+# proxy/main.py's existing _check_rate_limit, reused deliberately for
+# consistency rather than inventing a second scheme. Cheap on purpose: one
+# dict lookup + increment per request, no DB round trip on the hot path.
+#
+# Known limitation, accepted for v1: state is per-process, not shared across
+# horizontally-scaled instances, so a key could get up to
+# (N_instances * MAGNET_RATE_LIMIT_PER_MIN) requests/min if Render scales
+# out. Moving this to Postgres/Redis is a natural upgrade if that matters in
+# practice; not worth the extra hot-path round trip until it does.
+#
+# Applies to every authenticated entry point: the /mcp transport (keyed by
+# the API key's hash — "per API key" per spec), and every /api/* route
+# (keyed by whatever identity that route authenticates with: API key hash
+# for /api/team/*, Supabase user_id for the Supabase-session dashboard
+# routes via _require_user).
+
+_RATE_LIMIT_PER_MIN = int(os.environ.get("MAGNET_RATE_LIMIT_PER_MIN", "60"))
+_rate_limit_store: dict[tuple[str, int], int] = {}
+
+
+def _check_rate_limit(identifier: str, max_per_min: int = _RATE_LIMIT_PER_MIN) -> bool:
+    """Returns True if this request is allowed, False if identifier has
+    exceeded max_per_min requests in the current 60s bucket. Always counts
+    the current request (even if it turns out to be the one that exceeds),
+    matching proxy/main.py's existing semantics."""
+    minute = int(time.time() // 60)
+    key = (identifier, minute)
+    _rate_limit_store[key] = _rate_limit_store.get(key, 0) + 1
+    stale = [k for k in list(_rate_limit_store) if k[1] < minute - 1]
+    for k in stale:
+        del _rate_limit_store[k]
+    return _rate_limit_store[key] <= max_per_min
+
+
+_RATE_LIMIT_RESPONSE = JSONResponse(
+    {"error": "rate_limited", "message": "Rate limit exceeded, slow down."},
+    status_code=429,
 )
 
 
@@ -84,9 +128,13 @@ class MagnetAuthASGIMiddleware:
             )(scope, receive, send)
             return
 
+        if not _check_rate_limit(_hash_key(raw_key)):
+            await _RATE_LIMIT_RESPONSE(scope, receive, send)
+            return
+
         # Never trust anything from the request body — only the resolved
         # identity from the validated key.
-        tokens = _set_current_identity(identity["user_id"], identity["team_id"])
+        tokens = _set_current_identity(identity["user_id"], identity["team_id"], identity.get("key_id"))
         try:
             allowed = check_usage_limit(identity["user_id"], identity["team_id"])
             if not allowed:
@@ -149,6 +197,8 @@ async def _require_user(request):
             {"error": "unauthorized", "message": "Invalid or expired session token."},
             status_code=401,
         )
+    if not _check_rate_limit(user_id):
+        return _RATE_LIMIT_RESPONSE
     return user_id
 
 
@@ -165,14 +215,21 @@ async def list_keys(request) -> JSONResponse:
 
     with pool.connection() as conn:
         rows = conn.execute(
-            "SELECT id, name, masked_key, created_at, active FROM api_keys WHERE user_id = %s ORDER BY created_at DESC",
+            "SELECT id, name, masked_key, created_at, active, plan FROM api_keys WHERE user_id = %s ORDER BY created_at DESC",
             (user_id,),
         ).fetchall()
 
+    from magnet.usage_counter import get_usage_by_key
+
+    usage_by_key = get_usage_by_key(user_id)
+
     return JSONResponse({
         "keys": [
-            {"id": str(kid), "name": name, "masked": masked, "created_at": created_at.isoformat(), "active": active}
-            for kid, name, masked, created_at, active in rows
+            {
+                "id": str(kid), "name": name, "masked": masked, "created_at": created_at.isoformat(),
+                "active": active, "plan": plan, "sync_used": usage_by_key.get(str(kid), 0),
+            }
+            for kid, name, masked, created_at, active, plan in rows
         ]
     })
 
@@ -187,12 +244,49 @@ async def create_key(request) -> JSONResponse:
     except Exception:
         body = {}
     name = (body.get("name") or "").strip() or "Untitled key"
+    key_type = (body.get("type") or "individual").strip().lower()
+    if key_type not in ("individual", "team"):
+        return JSONResponse(
+            {"error": "bad_request", "message": "type must be 'individual' or 'team'."},
+            status_code=400,
+        )
 
     from magnet.postgres_store import get_pool_if_configured
 
     pool = get_pool_if_configured()
     if pool is None:
         return JSONResponse({"error": "unavailable", "message": "Postgres is not configured."}, status_code=503)
+
+    if key_type == "team":
+        # Gate: a "Team" key requires already belonging to a team — avoids
+        # a free-plan user minting a team-plan key out of nowhere, without
+        # a circular bootstrap problem (teams themselves are still free to
+        # create during beta, via POST /api/teams).
+        # TODO: BILLING HOOK — once billing is live, this is the one place
+        # a real subscription/payment check for the 'team' plan belongs,
+        # in addition to (not instead of) the team-membership check below.
+        from magnet.team_permissions import get_teams_for_user
+
+        if not get_teams_for_user(user_id):
+            return JSONResponse(
+                {
+                    "error": "team_required",
+                    "message": "Create or join a team first, then come back to make a Team key.",
+                },
+                status_code=400,
+            )
+        plan = "team"
+    else:
+        # "Individual" ties the new key to whatever individual (non-team)
+        # plan this user already holds — pro if they have any active pro
+        # key, otherwise free. Mirrors team_permissions.get_active_plan's
+        # "highest active plan wins" logic, scoped to non-team keys only.
+        with pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT plan FROM api_keys WHERE user_id = %s AND active = true AND plan != 'team'",
+                (user_id,),
+            ).fetchall()
+        plan = "pro" if any(r[0] == "pro" for r in rows) else "free"
 
     raw_key = "mg_sk_live_" + secrets.token_hex(32)
     key_hash = _hash_key(raw_key)
@@ -202,16 +296,16 @@ async def create_key(request) -> JSONResponse:
         row = conn.execute(
             """
             INSERT INTO api_keys (key_hash, user_id, name, masked_key, plan, active)
-            VALUES (%s, %s, %s, %s, 'free', true)
+            VALUES (%s, %s, %s, %s, %s, true)
             RETURNING id, created_at
             """,
-            (key_hash, user_id, name, masked),
+            (key_hash, user_id, name, masked, plan),
         ).fetchone()
 
     key_id, created_at = row
     return JSONResponse({
         "rawKey": raw_key,
-        "key": {"id": str(key_id), "name": name, "masked": masked, "created_at": created_at.isoformat()},
+        "key": {"id": str(key_id), "name": name, "masked": masked, "plan": plan, "created_at": created_at.isoformat()},
     })
 
 
@@ -272,6 +366,9 @@ async def team_check(request) -> JSONResponse:
             status_code=401,
         )
 
+    if not _check_rate_limit(_hash_key(raw_key)):
+        return _RATE_LIMIT_RESPONSE
+
     from magnet.team_permissions import PAID_PLANS
 
     plan = identity.get("plan")
@@ -301,6 +398,9 @@ async def team_op(request) -> JSONResponse:
             {"error": "unauthorized", "message": "Invalid, unknown, or inactive API key."},
             status_code=401,
         )
+
+    if not _check_rate_limit(_hash_key(raw_key)):
+        return _RATE_LIMIT_RESPONSE
 
     from magnet.team_permissions import (
         add_member, create_team, has_paid_plan, join_team, team_permission_denied_message,
@@ -338,15 +438,15 @@ async def team_op(request) -> JSONResponse:
     return JSONResponse({"error": "bad_request", "message": f"Unknown op {op!r}"}, status_code=400)
 
 
-# MCP tool names that mutate memory/team state — everything else recorded in
-# usage_events counts as a read. Kept here (not in usage_counter.py) since
-# it's dashboard-display logic, not metering logic.
-_WRITE_EVENTS = {
-    "remember", "forget_memory", "mark_done", "checkpoint", "save_now",
-    "create_team", "join_team", "add_team_member", "share_project_to_team",
-    "share_item_to_team", "create_profile", "create_project",
-    "set_active_context", "save_session", "add_team_signal",
-}
+def _sync_cap_for_plan(plan: str | None) -> int:
+    """Personal (non-team) monthly sync-request cap, mirroring
+    mcp_server._memory_cap_for_plan's paid/free split and env-var
+    convention. Display-only for now — see get_usage's TODO below for the
+    single enforcement seam this and memories_cap will plug into."""
+    from magnet.team_permissions import PAID_PLANS
+    if plan in PAID_PLANS:
+        return int(os.environ.get("MAGNET_PAID_SYNC_CAP", "50000"))
+    return int(os.environ.get("MAGNET_FREE_SYNC_CAP", "1000"))
 
 
 async def get_usage(request) -> JSONResponse:
@@ -356,10 +456,7 @@ async def get_usage(request) -> JSONResponse:
 
     from magnet.postgres_store import get_pool_if_configured
     from magnet.usage_counter import get_hosted_usage_summary
-
-    summary = get_hosted_usage_summary(user_id) or {}
-    writes = sum(count for event, count in summary.items() if event in _WRITE_EVENTS)
-    reads = sum(count for event, count in summary.items() if event not in _WRITE_EVENTS)
+    from magnet.mcp_server import _get_backend, _memory_count_key, _memory_cap_for_plan
 
     plan = "free"
     pool = get_pool_if_configured()
@@ -372,19 +469,36 @@ async def get_usage(request) -> JSONResponse:
         if row:
             plan = row[0]
 
-    store = _get_memory_store()
-    memories_stored = 0
-    for profile, _count in store.list_profiles(user_id):
-        for project in store.list_projects(user_id, profile):
-            memories_stored += len(store.load(user_id, profile, project))
+    # "sync request" = every validated tool call recorded this period,
+    # personal or team — same event log team_permissions.check_team_permission
+    # writes to, summed rather than filtered, since a personal cap doesn't
+    # need the read/write split the old writes_this_period/reads_this_period
+    # fields did.
+    summary = get_hosted_usage_summary(user_id) or {}
+    sync_used = sum(summary.values())
+    sync_cap = _sync_cap_for_plan(plan)
+
+    # Same maintained counter mcp_server._memory_cap_check reads/enforces on
+    # every write — using it here (not a live MemoryStore scan) means
+    # memories_used always matches what the cap is actually checked against.
+    backend = _get_backend()
+    memories_used = backend.hincrby(_memory_count_key(user_id), "total", 0)
+    memories_cap = _memory_cap_for_plan(plan)
 
     period_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
+    # TODO: BILLING HOOK — memories_cap/sync_cap are enforced today
+    # (mcp_server._memory_cap_check for writes; team sync cap via
+    # team_permissions.check_team_permission + MAGNET_ENFORCE_SYNC_CAP for
+    # team ops). A personal (non-team) sync_cap has no enforcement point
+    # yet — this response is display-only for that field until one exists.
     return JSONResponse({
         "plan": plan,
-        "memories_stored": memories_stored,
-        "writes_this_period": writes,
-        "reads_this_period": reads,
+        "memories_used": memories_used,
+        "memories_cap": memories_cap,
+        "sync_used": sync_used,
+        "sync_cap": sync_cap,
+        "rate_limit_per_min": _RATE_LIMIT_PER_MIN,
         "period_start": period_start.isoformat(),
     })
 
@@ -486,33 +600,9 @@ async def create_team_route(request) -> JSONResponse:
     if team is None:
         return JSONResponse({"error": "unavailable", "message": "Postgres is not configured."}, status_code=503)
 
-    # "Create team -> gives a team room id + shows the key" — one dashboard
-    # action mints the room AND a key scoped to it, same one-time-reveal
-    # convention as POST /api/keys.
-    from magnet.postgres_store import get_pool_if_configured
-
-    pool = get_pool_if_configured()
-    raw_key = "mg_sk_live_" + secrets.token_hex(32)
-    key_hash = _hash_key(raw_key)
-    masked = f"mg_sk_live_{raw_key[11:15]}...{raw_key[-4:]}"
-    key_name = f"{name} (team key)"
-
-    with pool.connection() as conn:
-        row = conn.execute(
-            """
-            INSERT INTO api_keys (key_hash, user_id, team_id, name, masked_key, plan, active)
-            VALUES (%s, %s, %s, %s, %s, 'team', true)
-            RETURNING id, created_at
-            """,
-            (key_hash, user_id, team["id"], key_name, masked),
-        ).fetchone()
-
-    key_id, created_at = row
-    return JSONResponse({
-        "team": team,
-        "rawKey": raw_key,
-        "key": {"id": str(key_id), "name": key_name, "masked": masked, "created_at": created_at.isoformat()},
-    })
+    # Key creation lives ONLY in the API Keys tab (type="team") — this route
+    # no longer mints one. Create the room, then go create a "Team" key.
+    return JSONResponse({"team": team})
 
 
 async def list_teams_route(request) -> JSONResponse:
@@ -566,6 +656,87 @@ async def update_team_storage_route(request) -> JSONResponse:
     return JSONResponse({"team": team})
 
 
+# ── Team member management (dashboard) ──────────────────────────────────────
+#
+# Owner + paid-plan enforced server-side in team_permissions._require_owner,
+# reused by all four routes below — lets the owner manage members without
+# the *team chat commands.
+
+async def list_team_members_route(request) -> JSONResponse:
+    user_id = await _require_user(request)
+    if isinstance(user_id, JSONResponse):
+        return user_id
+
+    team_id = request.path_params["team_id"]
+    from magnet.team_permissions import _require_owner, list_members
+
+    _, err = _require_owner(user_id, team_id)
+    if err:
+        return JSONResponse({"error": "denied", "message": err}, status_code=403)
+
+    return JSONResponse({"members": list_members(team_id)})
+
+
+async def add_team_member_route(request) -> JSONResponse:
+    user_id = await _require_user(request)
+    if isinstance(user_id, JSONResponse):
+        return user_id
+
+    team_id = request.path_params["team_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    # Accepts either field name — see add_team_member_route's known
+    # limitation noted in the dashboard's Team tab: this must be the
+    # teammate's Magnet user id today, not a real email lookup (no
+    # Supabase admin/email-resolution wired up server-side yet).
+    new_user_id = (body.get("user_id") or body.get("email") or "").strip()
+    if not new_user_id:
+        return JSONResponse(
+            {"error": "bad_request", "message": "user_id (or email) is required."},
+            status_code=400,
+        )
+
+    from magnet.team_permissions import add_member
+
+    ok, msg = add_member(user_id, team_id, new_user_id)
+    return JSONResponse({"ok": ok, "message": msg}, status_code=200 if ok else 403)
+
+
+async def update_team_member_role_route(request) -> JSONResponse:
+    user_id = await _require_user(request)
+    if isinstance(user_id, JSONResponse):
+        return user_id
+
+    team_id = request.path_params["team_id"]
+    target_user_id = request.path_params["user_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    new_role = (body.get("role") or "").strip()
+
+    from magnet.team_permissions import update_member_role
+
+    ok, msg = update_member_role(user_id, team_id, target_user_id, new_role)
+    return JSONResponse({"ok": ok, "message": msg}, status_code=200 if ok else 403)
+
+
+async def remove_team_member_route(request) -> JSONResponse:
+    user_id = await _require_user(request)
+    if isinstance(user_id, JSONResponse):
+        return user_id
+
+    team_id = request.path_params["team_id"]
+    target_user_id = request.path_params["user_id"]
+
+    from magnet.team_permissions import remove_member
+
+    ok, msg = remove_member(user_id, team_id, target_user_id)
+    return JSONResponse({"ok": ok, "message": msg}, status_code=200 if ok else 403)
+
+
 def _lifespan(app: Starlette):
     return session_manager.run()
 
@@ -601,6 +772,10 @@ def build_app() -> Starlette:
             Route("/api/teams", list_teams_route, methods=["GET"]),
             Route("/api/teams", create_team_route, methods=["POST"]),
             Route("/api/teams/{team_id}/storage", update_team_storage_route, methods=["PATCH"]),
+            Route("/api/teams/{team_id}/members", list_team_members_route, methods=["GET"]),
+            Route("/api/teams/{team_id}/members", add_team_member_route, methods=["POST"]),
+            Route("/api/teams/{team_id}/members/{user_id}", update_team_member_role_route, methods=["PATCH"]),
+            Route("/api/teams/{team_id}/members/{user_id}", remove_team_member_route, methods=["DELETE"]),
             Route("/api/team/check", team_check, methods=["POST"]),
             Route("/api/team/op", team_op, methods=["POST"]),
         ],

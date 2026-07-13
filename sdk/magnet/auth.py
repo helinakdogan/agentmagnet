@@ -29,9 +29,11 @@ def _hash_key(raw_key: str) -> str:
 
 def validate_key(raw_key: str) -> dict | None:
     """
-    Returns {"user_id": str, "team_id": str, "plan": str, "active": bool}
-    on success, or None if the key is missing, malformed, unknown, or
-    inactive — callers should treat every None the same way (generic 401).
+    Returns {"user_id": str, "team_id": str, "plan": str, "active": bool,
+    "key_id": str} on success, or None if the key is missing, malformed,
+    unknown, or inactive — callers should treat every None the same way
+    (generic 401). key_id is used only to tag usage_events rows for
+    per-key usage breakdowns, never for identity/authorization.
 
     team_id is "" (never None) when the key has no team, so downstream
     identity plumbing (mcp_server's contextvars) has one canonical
@@ -58,7 +60,7 @@ def validate_key(raw_key: str) -> dict | None:
     try:
         with pool.connection() as conn:
             row = conn.execute(
-                "SELECT user_id, team_id, plan, active FROM api_keys WHERE key_hash = %s",
+                "SELECT id, user_id, team_id, plan, active FROM api_keys WHERE key_hash = %s",
                 (key_hash,),
             ).fetchone()
     except Exception as e:
@@ -68,7 +70,7 @@ def validate_key(raw_key: str) -> dict | None:
     if row is None:
         return None
 
-    user_id, team_id, plan, active = row
+    key_id, user_id, team_id, plan, active = row
     if not active:
         return None
 
@@ -77,6 +79,7 @@ def validate_key(raw_key: str) -> dict | None:
         "team_id": team_id or "",
         "plan": plan,
         "active": bool(active),
+        "key_id": str(key_id),
     }
 
 

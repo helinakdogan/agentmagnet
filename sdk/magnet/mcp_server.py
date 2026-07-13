@@ -70,6 +70,7 @@ _ACTIVE_FILE = Path.home() / ".agent-magnet" / "active.json"
 _UNSET = object()
 _user_id_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("magnet_user_id", default=_UNSET)
 _team_id_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("magnet_team_id", default=_UNSET)
+_key_id_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("magnet_key_id", default=_UNSET)
 
 
 def _current_user_id() -> str:
@@ -82,15 +83,26 @@ def _current_team_id() -> str:
     return _DEFAULT_TEAM_ID if v is _UNSET else v
 
 
-def _set_current_identity(user_id: str, team_id: str) -> tuple:
+def _current_key_id() -> str | None:
+    """The api_keys.id (as str) of the mg_sk_... key that authenticated this
+    request — None in stdio mode (no keys there at all) or if somehow unset.
+    Used only to tag usage_events rows for per-key usage breakdowns; never
+    used for identity/authorization (that's user_id/team_id's job)."""
+    v = _key_id_ctx.get()
+    return None if v is _UNSET else v
+
+
+def _set_current_identity(user_id: str, team_id: str, key_id: str | None = None) -> tuple:
     """Called only by http_server.py's auth middleware, once per request."""
-    return _user_id_ctx.set(user_id), _team_id_ctx.set(team_id)
+    return _user_id_ctx.set(user_id), _team_id_ctx.set(team_id), _key_id_ctx.set(key_id)
 
 
 def _reset_current_identity(tokens: tuple) -> None:
     """Called only by http_server.py's auth middleware, in a finally block."""
     _user_id_ctx.reset(tokens[0])
     _team_id_ctx.reset(tokens[1])
+    if len(tokens) > 2:
+        _key_id_ctx.reset(tokens[2])
 
 
 def _in_hosted_request() -> bool:
@@ -191,11 +203,16 @@ _PREFERENCE_TRIGGERS = frozenset({
 })
 
 
-async def _extract_from_messages(messages: list[dict], user: str, profile: str, project: str) -> int:
-    """Extract project-relevant insights from a message window and save to MemoryStore."""
+async def _extract_from_messages(
+    messages: list[dict], user: str, profile: str, project: str
+) -> tuple[int, bool]:
+    """Extract project-relevant insights from a message window and save to
+    MemoryStore. Returns (saved_count, cap_hit) — cap_hit is always False
+    outside hosted mode."""
     from magnet.local_extractor import detect_category
     store = _get_memory_store()
     saved = 0
+    cap_hit = False
     for msg in messages:
         if msg.get("role") != "user":
             continue
@@ -208,10 +225,14 @@ async def _extract_from_messages(messages: list[dict], user: str, profile: str, 
             text_lower = text.lower()
             if not any(kw in text_lower for kw in _PREFERENCE_TRIGGERS):
                 continue
+        if await _memory_cap_check(user):
+            cap_hit = True
+            break
         added = await asyncio.to_thread(store.add_entry, user, profile, project, category, text)
         if added:
             saved += 1
-    return saved
+            await _record_memory_delta(user, 1)
+    return saved, cap_hit
 
 
 # ── Singleton backends ────────────────────────────────────────────────────────
@@ -1050,7 +1071,7 @@ def _record_usage_event(tool_name: str) -> None:
     metering can never break a tool response."""
     try:
         from magnet.usage_counter import record_usage_event
-        record_usage_event(_current_user_id(), _current_team_id(), tool_name)
+        record_usage_event(_current_user_id(), _current_team_id(), tool_name, key_id=_current_key_id())
     except Exception as e:
         logger.debug(f"[usage] _record_usage_event failed: {e}")
 
@@ -1267,8 +1288,14 @@ async def _handle_remember(
     if not extracted:
         return f"Nothing to save. {_ctx_tag(profile, project)}"
 
+    cap_msg = await _memory_cap_check(user)
+    if cap_msg:
+        return f"{cap_msg} {_ctx_tag(profile, project)}"
+
     category = _SIGNAL_TO_CATEGORY.get(signal_type, "preference")
     saved = await asyncio.to_thread(store.add_entry, user, profile, project, category, extracted)
+    if saved:
+        await _record_memory_delta(user, 1)
     usage.record_write(project)
 
     ctx = _ctx_tag(profile, project)
@@ -1319,6 +1346,7 @@ async def _handle_forget_memory(
     if item_id:
         removed = await asyncio.to_thread(store.delete_entry, user, profile, project, item_id)
         if removed:
+            await _record_memory_delta(user, -1)
             return f"Forgot: '{removed['text'][:80]}' from {removed['category']}. {ctx}"
         return f"No item with id '{item_id}' found in {profile} / {project}."
 
@@ -1399,6 +1427,68 @@ def _is_hosted_mode() -> bool:
     MAGNET_REDIS_URL is completely irrelevant to this decision; it only
     ever affects WHERE team data is stored once permission is granted."""
     return bool(os.environ.get("MAGNET_DATABASE_URL"))
+
+
+# ── Memory cap — Part 2 of the hard usage limits ────────────────────────────
+#
+# Caps stored memory items per user, keyed by plan. Hosted mode only — stdio/
+# local storage costs us nothing (it's the user's own disk), so there is
+# nothing to protect there and it is never capped, matching _is_hosted_mode's
+# use everywhere else in this file.
+#
+# Counted via a maintained counter (hincrby on a hash field), not a full
+# scan: MemoryStore's own storage is JSON blobs across many
+# vmm:{user}:{profile}:{project} keys with no cheap "total items for this
+# user across every profile/project" query, so a running counter incremented
+# on every successful add_entry / decremented on every successful
+# delete_entry is the only O(1) option. This trades perfect exactness (a
+# crash between add_entry succeeding and the counter update would drift by
+# one) for being safe to call on every single write — an acceptable
+# tradeoff for a protective cap, not a billing ledger.
+
+_MEMORY_CAP_MSG = "Memory limit reached for your plan. Upgrade or remove items at agentmagnet.app."
+
+
+def _memory_cap_for_plan(plan: str | None) -> int:
+    from magnet.team_permissions import PAID_PLANS
+    if plan in PAID_PLANS:
+        return int(os.environ.get("MAGNET_PAID_MEMORY_CAP", "50000"))
+    return int(os.environ.get("MAGNET_FREE_MEMORY_CAP", "1000"))
+
+
+def _memory_count_key(user: str) -> str:
+    return f"magnet:memcount:{user.strip().lower()}"
+
+
+async def _memory_cap_check(user: str) -> str | None:
+    """Returns None if the write is allowed, or the deny message if `user`
+    is already at/over their plan's memory cap. No-op (always None) outside
+    hosted mode."""
+    if not _is_hosted_mode():
+        return None
+    from magnet.team_permissions import get_active_plan
+    plan = await asyncio.to_thread(get_active_plan, user)
+    cap = _memory_cap_for_plan(plan)
+    backend = _get_backend()
+    # hincrby(..., 0) reads the current value without changing it — cheap,
+    # O(1), same call used to increment; no separate "hget" needed.
+    current = await asyncio.to_thread(backend.hincrby, _memory_count_key(user), "total", 0)
+    if current >= cap:
+        return _MEMORY_CAP_MSG
+    return None
+
+
+async def _record_memory_delta(user: str, delta: int) -> None:
+    """Adjusts the maintained per-user item counter. No-op outside hosted
+    mode. Best-effort — a counter update failure must never break the write
+    it's accounting for."""
+    if not _is_hosted_mode():
+        return
+    try:
+        backend = _get_backend()
+        await asyncio.to_thread(backend.hincrby, _memory_count_key(user), "total", delta)
+    except Exception as e:
+        logger.debug(f"[memory_cap] counter update failed: {e}")
 
 
 _STDIO_NO_KEY_MSG = "Team memory requires a paid Agent Magnet key. Get one at agentmagnet.app."
@@ -1939,7 +2029,7 @@ async def _handle_checkpoint(
     project: str | None = None,
 ) -> str:
     user, profile, project = _resolve_context(profile, project)
-    saved = await _extract_from_messages(messages, user, profile, project)
+    saved, cap_hit = await _extract_from_messages(messages, user, profile, project)
     _get_usage_counter().record_write(project)
     _write_rhythm(
         profile, project,
@@ -1949,9 +2039,10 @@ async def _handle_checkpoint(
         last_items_saved=saved,
     )
     ctx = _ctx_tag(profile, project)
+    cap_note = f" {_MEMORY_CAP_MSG}" if cap_hit else ""
     if saved:
-        return f"Checkpoint — {saved} item{'s' if saved != 1 else ''} saved. {ctx}"
-    return f"Checkpoint — nothing new to save. {ctx}"
+        return f"Checkpoint — {saved} item{'s' if saved != 1 else ''} saved.{cap_note} {ctx}"
+    return f"Checkpoint — nothing new to save.{cap_note} {ctx}"
 
 
 async def _handle_save_now(
@@ -1960,7 +2051,7 @@ async def _handle_save_now(
     project: str | None = None,
 ) -> str:
     user, profile, project = _resolve_context(profile, project)
-    saved = await _extract_from_messages(messages, user, profile, project)
+    saved, cap_hit = await _extract_from_messages(messages, user, profile, project)
     _get_usage_counter().record_write(project)
     _write_rhythm(
         profile, project,
@@ -1972,10 +2063,11 @@ async def _handle_save_now(
     ctx = _ctx_tag(profile, project)
     store = _get_memory_store()
     total = len(await asyncio.to_thread(store.load, user, profile, project))
+    cap_note = f" {_MEMORY_CAP_MSG}" if cap_hit else ""
     return (
         f"Saved everything up to here for {ctx}. "
         f"{saved} new item{'s' if saved != 1 else ''} captured. "
-        f"{total} total memories in this project."
+        f"{total} total memories in this project.{cap_note}"
     )
 
 
@@ -2110,8 +2202,12 @@ async def _promote_summary_to_memory(
             continue
         cat = detect_category(text)
         if cat in project_categories:
+            if await _memory_cap_check(user):
+                break
             try:
-                await asyncio.to_thread(store.add_entry, user, profile, project, cat, text)
+                added = await asyncio.to_thread(store.add_entry, user, profile, project, cat, text)
+                if added:
+                    await _record_memory_delta(user, 1)
             except Exception as e:
                 logger.debug(f"_promote_summary: {e}")
 

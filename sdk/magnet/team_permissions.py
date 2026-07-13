@@ -182,23 +182,47 @@ def join_team(user_id: str, team_id: str) -> dict | None:
     return get_team(team_id)
 
 
-def add_member(actor_user_id: str, team_id: str, new_user_id: str) -> tuple[bool, str]:
-    """Owner-only. Mirrors the same role-check message the open package used
-    to enforce client-side — now enforced here instead."""
+def _require_owner(actor_user_id: str, team_id: str) -> tuple[dict | None, str | None]:
+    """Shared gate for every dashboard membership-management endpoint
+    (list/add/edit-role/remove): actor_user_id must currently hold a paid
+    plan AND be the OWNER of an active team_id. Returns (team_dict, None)
+    on success, (None, message) on any denial — message is safe to return
+    to the caller as-is."""
+    if not has_paid_plan(actor_user_id):
+        return None, team_permission_denied_message(actor_user_id)
+
+    team = get_team(team_id)
+    if team is None or not team.get("active"):
+        return None, "Team not found."
+
     from magnet.postgres_store import get_pool_if_configured
 
     pool = get_pool_if_configured()
     if pool is None:
-        return False, TEAM_KEY_REQUIRED_MSG
+        return None, TEAM_KEY_REQUIRED_MSG
 
     with pool.connection() as conn:
         role_row = conn.execute(
             "SELECT role FROM team_members WHERE team_id = %s AND user_id = %s",
             (team_id, actor_user_id),
         ).fetchone()
-        if not role_row or role_row[0] != "owner":
-            return False, "Only the team owner can add members directly. Share your team_id instead."
+    if not role_row or role_row[0] != "owner":
+        return None, "Only the team owner can manage members."
 
+    return team, None
+
+
+def add_member(actor_user_id: str, team_id: str, new_user_id: str) -> tuple[bool, str]:
+    """Owner-only, paid-plan-only. Mirrors the same role-check message the
+    open package used to enforce client-side — now enforced here instead."""
+    _, err = _require_owner(actor_user_id, team_id)
+    if err:
+        return False, err
+
+    from magnet.postgres_store import get_pool_if_configured
+
+    pool = get_pool_if_configured()
+    with pool.connection() as conn:
         already = conn.execute(
             "SELECT 1 FROM team_members WHERE team_id = %s AND user_id = %s",
             (team_id, new_user_id),
@@ -211,6 +235,62 @@ def add_member(actor_user_id: str, team_id: str, new_user_id: str) -> tuple[bool
             (team_id, new_user_id),
         )
     return True, f"'{new_user_id}' added to the team."
+
+
+def remove_member(actor_user_id: str, team_id: str, target_user_id: str) -> tuple[bool, str]:
+    """Owner-only, paid-plan-only. The owner can't remove themselves this
+    way (avoids leaving a team ownerless) — they'd transfer ownership via
+    update_member_role first."""
+    if target_user_id == actor_user_id:
+        return False, "The team owner can't remove themselves. Make someone else owner first."
+
+    _, err = _require_owner(actor_user_id, team_id)
+    if err:
+        return False, err
+
+    from magnet.postgres_store import get_pool_if_configured
+
+    pool = get_pool_if_configured()
+    with pool.connection() as conn:
+        result = conn.execute(
+            "DELETE FROM team_members WHERE team_id = %s AND user_id = %s",
+            (team_id, target_user_id),
+        )
+        removed = result.rowcount > 0
+    if not removed:
+        return False, f"'{target_user_id}' is not a member of this team."
+    return True, f"'{target_user_id}' removed from the team."
+
+
+def update_member_role(actor_user_id: str, team_id: str, target_user_id: str, new_role: str) -> tuple[bool, str]:
+    """Owner-only, paid-plan-only. The owner can't change their own role
+    through this endpoint (same "don't leave a team ownerless" reasoning as
+    remove_member)."""
+    if new_role not in ("member", "owner"):
+        return False, "role must be 'member' or 'owner'."
+    if target_user_id == actor_user_id:
+        return False, "You can't change your own role. Ask another owner, or transfer ownership first."
+
+    _, err = _require_owner(actor_user_id, team_id)
+    if err:
+        return False, err
+
+    from magnet.postgres_store import get_pool_if_configured
+
+    pool = get_pool_if_configured()
+    with pool.connection() as conn:
+        target_row = conn.execute(
+            "SELECT 1 FROM team_members WHERE team_id = %s AND user_id = %s",
+            (team_id, target_user_id),
+        ).fetchone()
+        if not target_row:
+            return False, f"'{target_user_id}' is not a member of this team."
+
+        conn.execute(
+            "UPDATE team_members SET role = %s WHERE team_id = %s AND user_id = %s",
+            (new_role, team_id, target_user_id),
+        )
+    return True, f"'{target_user_id}' is now {new_role}."
 
 
 def list_members(team_id: str) -> list[dict]:
@@ -406,13 +486,29 @@ def check_team_permission(user_id: str, team_id: str, action: str = "read") -> d
         if member_row is None:
             return None
 
-    # TODO: BILLING HOOK — this is the ONE place future enforcement plugs
-    # in. Once billing is live: call get_team_sync_usage(team_id), compare
-    # against team["sync_limit"], and return None (denied) if exceeded.
-    # During beta, every membership-valid call is allowed.
+    # Monthly sync cap — soft for beta, hard when MAGNET_ENFORCE_SYNC_CAP=true.
+    # Counted from usage_events (get_team_sync_usage), not a separate
+    # maintained counter, per spec — it's an indexed COUNT(*) over
+    # (team_id, created_at), see migrations/0005_usage_events_team_index.sql.
+    sync_cap = int(os.environ.get("MAGNET_TEAM_SYNC_CAP", "50000"))
+    enforce_sync_cap = os.environ.get("MAGNET_ENFORCE_SYNC_CAP", "false").strip().lower() == "true"
+    current_sync_usage = get_team_sync_usage(team_id)
+    if current_sync_usage >= sync_cap:
+        if enforce_sync_cap:
+            logger.warning(
+                f"[team_permissions] team {team_id} DENIED: monthly sync cap exceeded "
+                f"({current_sync_usage}/{sync_cap}), MAGNET_ENFORCE_SYNC_CAP=true"
+            )
+            return None
+        logger.warning(
+            f"[team_permissions] team {team_id} exceeded monthly sync cap "
+            f"({current_sync_usage}/{sync_cap}) — NOT enforced (beta; set "
+            f"MAGNET_ENFORCE_SYNC_CAP=true to start denying)"
+        )
 
     from magnet.usage_counter import record_usage_event
-    record_usage_event(user_id, team_id, action)
+    from magnet.mcp_server import _current_key_id
+    record_usage_event(user_id, team_id, action, key_id=_current_key_id())
 
     return _team_row_to_dict(team_row)
 

@@ -130,10 +130,12 @@ def check_usage_limit(user_id: str, team_id: str = "") -> bool:  # noqa: ARG001
     return True
 
 
-def record_usage_event(user_id: str, team_id: str, event_type: str) -> None:
+def record_usage_event(user_id: str, team_id: str, event_type: str, key_id: str | None = None) -> None:
     """Best-effort INSERT into usage_events. No-op outside hosted/Postgres
     mode. Metering must never break a tool call — all failures are swallowed
-    (logged at debug level only)."""
+    (logged at debug level only). key_id (the mg_sk_... key that made this
+    call, if any) is optional and used only for per-key usage breakdowns —
+    never for identity/authorization."""
     from magnet.postgres_store import get_pool_if_configured
 
     pool = get_pool_if_configured()
@@ -142,8 +144,8 @@ def record_usage_event(user_id: str, team_id: str, event_type: str) -> None:
     try:
         with pool.connection() as conn:
             conn.execute(
-                "INSERT INTO usage_events (user_id, team_id, event_type) VALUES (%s, %s, %s)",
-                (user_id, team_id or None, event_type),
+                "INSERT INTO usage_events (user_id, team_id, event_type, key_id) VALUES (%s, %s, %s, %s)",
+                (user_id, team_id or None, event_type, key_id),
             )
     except Exception as e:
         logger.debug(f"[usage] record_usage_event failed: {e}")
@@ -174,3 +176,32 @@ def get_hosted_usage_summary(user_id: str, team_id: str = "") -> dict | None:  #
     except Exception as e:
         logger.debug(f"[usage] get_hosted_usage_summary failed: {e}")
         return None
+
+
+def get_usage_by_key(user_id: str) -> dict[str, int]:
+    """Returns {key_id: count} of validated calls this calendar month, for
+    every one of this user's keys that has made at least one call — feeds
+    the dashboard's per-key usage breakdown (API Keys tab / Usage tab).
+    Rows recorded before key_id existed, or from dashboard actions that
+    aren't tied to a specific mg_sk_... key, have key_id IS NULL and are
+    excluded here (there's no key to attribute them to)."""
+    from magnet.postgres_store import get_pool_if_configured
+
+    pool = get_pool_if_configured()
+    if pool is None:
+        return {}
+    try:
+        with pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT key_id, COUNT(*) FROM usage_events
+                WHERE user_id = %s AND key_id IS NOT NULL
+                  AND created_at >= date_trunc('month', now())
+                GROUP BY key_id
+                """,
+                (user_id,),
+            ).fetchall()
+        return {str(key_id): count for key_id, count in rows}
+    except Exception as e:
+        logger.debug(f"[usage] get_usage_by_key failed: {e}")
+        return {}
