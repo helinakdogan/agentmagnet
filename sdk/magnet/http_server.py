@@ -104,7 +104,26 @@ async def health(request) -> JSONResponse:
     # Deliberately does NOT touch Postgres — must stay up even during a
     # transient DB blip, so a health-check flap doesn't take the whole
     # service down.
-    return JSONResponse({"status": "ok"})
+    #
+    # package_version + git_commit let anyone confirm what's ACTUALLY
+    # running in one curl, instead of assuming source and deployment match.
+    # Two real incidents already happened from that exact assumption being
+    # wrong: the PyPI package (agent-magnet) shipped without the team
+    # plan-gate fix for several versions, and a stale mcp.agentmagnet.app
+    # deploy was mistaken for a live bug in the plan-gate logic itself when
+    # it was actually already fixed in source. git_commit is None unless
+    # the platform sets it (Render sets RENDER_GIT_COMMIT automatically for
+    # git-connected deploys).
+    try:
+        from importlib.metadata import version as _pkg_version
+        package_version = _pkg_version("agent-magnet")
+    except Exception:
+        package_version = None
+    return JSONResponse({
+        "status": "ok",
+        "package_version": package_version,
+        "git_commit": os.environ.get("RENDER_GIT_COMMIT"),
+    })
 
 
 # ── Dashboard API — Supabase-session-authenticated, distinct from the
@@ -219,6 +238,104 @@ async def revoke_key(request) -> JSONResponse:
     if not found:
         return JSONResponse({"error": "not_found", "message": "Key not found."}, status_code=404)
     return JSONResponse({"ok": True})
+
+
+# ── Team stdio-relay routes — mg_sk_ key auth (same convention as /mcp) ─────
+#
+# stdio/local Agent Magnet processes never hold Postgres credentials (see
+# team_permissions.py's module docstring), so they cannot call
+# team_permissions.py directly the way this HTTP server can. These two
+# routes are the ONLY way a stdio process can verify team-plan permission
+# and perform team-mutating operations — see magnet.hosted_client, the
+# stdio-side counterpart, and mcp_server.py's stdio branches of
+# _handle_create_team/_handle_join_team/_handle_add_team_member.
+#
+# Deliberately mg_sk_-key-authenticated (identical convention to /mcp), NOT
+# Supabase-session-authenticated like the dashboard routes above/below —
+# the caller here is a local process acting on behalf of its configured
+# MAGNET_API_KEY, not a logged-in dashboard user in a browser.
+
+async def team_check(request) -> JSONResponse:
+    """General entitlement check: does this key currently carry a paid
+    ('team' or 'pro') plan? Used by stdio as the FIRST gate before
+    attempting any team operation at all."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    raw_key = (body.get("key") or "").strip()
+
+    identity = validate_key(raw_key)
+    if identity is None or not identity.get("active"):
+        return JSONResponse(
+            {"allowed": False, "plan": None, "message": "Invalid, unknown, or inactive API key."},
+            status_code=401,
+        )
+
+    from magnet.team_permissions import PAID_PLANS
+
+    plan = identity.get("plan")
+    return JSONResponse({
+        "allowed": plan in PAID_PLANS,
+        "plan": plan,
+        "user_id": identity["user_id"],
+    })
+
+
+async def team_op(request) -> JSONResponse:
+    """
+    Relay for the team-mutating MCP tools (create_team/join_team/
+    add_team_member) when invoked from stdio. Re-validates the key AND
+    re-checks the plan server-side — never trusts that a prior call to
+    team_check() already covered this; each request stands alone.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    raw_key = (body.get("key") or "").strip()
+
+    identity = validate_key(raw_key)
+    if identity is None or not identity.get("active"):
+        return JSONResponse(
+            {"error": "unauthorized", "message": "Invalid, unknown, or inactive API key."},
+            status_code=401,
+        )
+
+    from magnet.team_permissions import (
+        add_member, create_team, has_paid_plan, join_team, team_permission_denied_message,
+    )
+
+    user_id = identity["user_id"]
+    if not has_paid_plan(user_id):
+        return JSONResponse(
+            {"error": "plan_required", "message": team_permission_denied_message(user_id)},
+            status_code=402,
+        )
+
+    op = body.get("op")
+
+    if op == "create_team":
+        name = (body.get("name") or "").strip() or "My Team"
+        team = create_team(user_id, name)
+        if team is None:
+            return JSONResponse({"error": "unavailable", "message": "Postgres is not configured."}, status_code=503)
+        return JSONResponse({"team": team})
+
+    if op == "join_team":
+        team_id = body.get("team_id")
+        team = join_team(user_id, team_id)
+        if team is None:
+            return JSONResponse({"error": "not_found", "message": "Team not found or inactive."}, status_code=404)
+        return JSONResponse({"team": team})
+
+    if op == "add_member":
+        team_id = body.get("team_id")
+        new_user_id = body.get("new_user_id")
+        ok, msg = add_member(user_id, team_id, new_user_id)
+        return JSONResponse({"ok": ok, "message": msg}, status_code=200 if ok else 403)
+
+    return JSONResponse({"error": "bad_request", "message": f"Unknown op {op!r}"}, status_code=400)
 
 
 # MCP tool names that mutate memory/team state — everything else recorded in
@@ -484,6 +601,8 @@ def build_app() -> Starlette:
             Route("/api/teams", list_teams_route, methods=["GET"]),
             Route("/api/teams", create_team_route, methods=["POST"]),
             Route("/api/teams/{team_id}/storage", update_team_storage_route, methods=["PATCH"]),
+            Route("/api/team/check", team_check, methods=["POST"]),
+            Route("/api/team/op", team_op, methods=["POST"]),
         ],
         middleware=[
             Middleware(

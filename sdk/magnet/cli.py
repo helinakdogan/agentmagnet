@@ -98,7 +98,7 @@ def _claude_md_block(user_id: str) -> str:
         "If they say *memory all or ask to see everything across all projects,",
         "call `show_all_memory` with show_all=true for a cross-project overview.",
         "",
-        "Team memory (Pro, free during beta — requires shared Redis):",
+        "Team memory (requires a paid Agent Magnet key — MAGNET_API_KEY, plan team/pro):",
         "*team new <name> → call create_team. Returns a team_id to share with teammates.",
         "*team join <id> → call join_team. Then add MAGNET_TEAM_ID to MCP config.",
         "*team members → call list_team_members to show who's in the team.",

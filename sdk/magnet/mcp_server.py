@@ -525,7 +525,10 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Create a new team and become its owner. "
                 "Triggered by '*team new <name>'. "
-                "REQUIRES shared Redis (MAGNET_REDIS_URL must be set). "
+                "REQUIRES a paid Agent Magnet key (MAGNET_API_KEY, plan team/pro) — "
+                "get one at agentmagnet.app. Setting MAGNET_REDIS_URL alone does "
+                "nothing; it only decides where shared data lives after a paid key "
+                "has already been verified. "
                 "Returns a team_id (e.g. 'team-a1b2c3') to share with teammates. "
                 "Teammates join with join_team(team_id)."
             ),
@@ -543,7 +546,8 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Join an existing team by id. "
                 "Triggered by '*team join <team_id>'. "
-                "REQUIRES shared Redis. The team_id is given by the team owner."
+                "REQUIRES a paid Agent Magnet key (MAGNET_API_KEY, plan team/pro) — "
+                "get one at agentmagnet.app. The team_id is given by the team owner."
             ),
             inputSchema={
                 "type": "object",
@@ -1386,22 +1390,69 @@ async def _handle_mark_done(
 # that's true in both stdio and HTTP transports, since this dispatch code is
 # shared between them. See team_permissions.py's module docstring.
 
+def _is_hosted_mode() -> bool:
+    """True only when running as agent-magnet-http, which holds direct
+    Postgres credentials. False in stdio — which must NEVER treat local
+    state (MAGNET_REDIS_URL, MAGNET_TEAM_ID, or anything else local) as
+    permission. stdio verifies team-plan access exclusively by calling the
+    hosted server over HTTPS — see hosted_client.py — using MAGNET_API_KEY.
+    MAGNET_REDIS_URL is completely irrelevant to this decision; it only
+    ever affects WHERE team data is stored once permission is granted."""
+    return bool(os.environ.get("MAGNET_DATABASE_URL"))
+
+
+_STDIO_NO_KEY_MSG = "Team memory requires a paid Agent Magnet key. Get one at agentmagnet.app."
+_STDIO_UNREACHABLE_MSG = "Could not verify your plan with the hosted server. Try again shortly."
+
+
+async def _stdio_team_permission_check() -> tuple[str, None] | tuple[None, str]:
+    """
+    stdio-mode gate: returns (api_key, None) if a hosted, paid-plan key is
+    confirmed by the hosted server, or (None, deny_message) otherwise.
+
+    Every branch here fails closed:
+      - no MAGNET_API_KEY at all         -> deny, no network call made
+      - hosted server unreachable/error  -> deny (never treated as "allow")
+      - key invalid/inactive/free plan   -> deny with the hosted server's message
+    There is no code path in here that can return "allowed" without a
+    successful, plan-confirming round trip to the hosted server.
+    """
+    api_key = os.environ.get("MAGNET_API_KEY", "").strip()
+    if not api_key:
+        return None, _STDIO_NO_KEY_MSG
+
+    from magnet.hosted_client import check_team_key
+
+    check = await asyncio.to_thread(check_team_key, api_key)
+    if check is None:
+        return None, _STDIO_UNREACHABLE_MSG
+    if not check.get("allowed"):
+        from magnet.team_permissions import PLAN_REQUIRED_MSG
+        return None, check.get("message") or PLAN_REQUIRED_MSG
+    return api_key, None
+
+
 async def _handle_create_team(team_name: str) -> str:
-    from magnet.team_permissions import (
-        create_team, has_paid_plan, team_permission_denied_message, TEAM_KEY_REQUIRED_MSG,
-    )
     user = _current_user_id()
-    if not await asyncio.to_thread(has_paid_plan, user):
-        # NOTE: this gate is deliberately only here (the mg_sk_-key/MCP-tool
-        # path), not inside team_permissions.create_team() itself — that
-        # function is also called by the dashboard's Supabase-session
-        # "create a team" flow, which mints a user's very first team-plan
-        # key AT creation time and would be impossible to pass a
-        # pre-existing-paid-key check.
-        return await asyncio.to_thread(team_permission_denied_message, user)
-    team = await asyncio.to_thread(create_team, user, team_name)
-    if team is None:
-        return TEAM_KEY_REQUIRED_MSG
+
+    if _is_hosted_mode():
+        from magnet.team_permissions import (
+            create_team, has_paid_plan, team_permission_denied_message, TEAM_KEY_REQUIRED_MSG,
+        )
+        if not await asyncio.to_thread(has_paid_plan, user):
+            return await asyncio.to_thread(team_permission_denied_message, user)
+        team = await asyncio.to_thread(create_team, user, team_name)
+        if team is None:
+            return TEAM_KEY_REQUIRED_MSG
+    else:
+        api_key, deny_msg = await _stdio_team_permission_check()
+        if deny_msg:
+            return deny_msg
+        from magnet.hosted_client import remote_create_team
+        team = await asyncio.to_thread(remote_create_team, api_key, team_name)
+        if team is None:
+            return "Could not create the team on the hosted server. Try again shortly."
+
     team_id = team["id"]
     _get_usage_counter().record_team_write(team_id)
     return (
@@ -1414,15 +1465,26 @@ async def _handle_create_team(team_name: str) -> str:
 
 
 async def _handle_join_team(team_id: str) -> str:
-    from magnet.team_permissions import (
-        join_team, has_paid_plan, team_permission_denied_message, TEAM_KEY_REQUIRED_MSG,
-    )
     user = _current_user_id()
-    if not await asyncio.to_thread(has_paid_plan, user):
-        return await asyncio.to_thread(team_permission_denied_message, user)
-    team = await asyncio.to_thread(join_team, user, team_id)
-    if team is None:
-        return TEAM_KEY_REQUIRED_MSG
+
+    if _is_hosted_mode():
+        from magnet.team_permissions import (
+            join_team, has_paid_plan, team_permission_denied_message, TEAM_KEY_REQUIRED_MSG,
+        )
+        if not await asyncio.to_thread(has_paid_plan, user):
+            return await asyncio.to_thread(team_permission_denied_message, user)
+        team = await asyncio.to_thread(join_team, user, team_id)
+        if team is None:
+            return TEAM_KEY_REQUIRED_MSG
+    else:
+        api_key, deny_msg = await _stdio_team_permission_check()
+        if deny_msg:
+            return deny_msg
+        from magnet.hosted_client import remote_join_team
+        team = await asyncio.to_thread(remote_join_team, api_key, team_id)
+        if team is None:
+            return "Could not join the team on the hosted server (it may not exist). Try again shortly."
+
     _get_usage_counter().record_team_write(team_id)
     return (
         f"Joined team '{team['name']}' ({team_id}).\n\n"
@@ -1432,14 +1494,23 @@ async def _handle_join_team(team_id: str) -> str:
 
 
 async def _handle_add_team_member(team_id: str, user_id: str) -> str:
-    from magnet.team_permissions import add_member, has_paid_plan, team_permission_denied_message
     actor = _current_user_id()
-    if not await asyncio.to_thread(has_paid_plan, actor):
-        return await asyncio.to_thread(team_permission_denied_message, actor)
-    try:
-        ok, msg = await asyncio.to_thread(add_member, actor, team_id, user_id)
-    except Exception as e:
-        return f"Could not add member: {e}"
+
+    if _is_hosted_mode():
+        from magnet.team_permissions import add_member, has_paid_plan, team_permission_denied_message
+        if not await asyncio.to_thread(has_paid_plan, actor):
+            return await asyncio.to_thread(team_permission_denied_message, actor)
+        try:
+            ok, msg = await asyncio.to_thread(add_member, actor, team_id, user_id)
+        except Exception as e:
+            return f"Could not add member: {e}"
+    else:
+        api_key, deny_msg = await _stdio_team_permission_check()
+        if deny_msg:
+            return deny_msg
+        from magnet.hosted_client import remote_add_member
+        ok, msg = await asyncio.to_thread(remote_add_member, api_key, team_id, user_id)
+
     if not ok:
         return msg
     _get_usage_counter().record_team_write(team_id)
