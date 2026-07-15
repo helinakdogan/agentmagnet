@@ -36,6 +36,7 @@ from magnet.mcp_server import _set_current_identity, _reset_current_identity
 from magnet.mcp_server import _get_memory_store, _get_team_store
 from magnet.auth import validate_key, verify_supabase_jwt, verify_mcp_oauth_token, _hash_key
 from magnet.usage_counter import check_usage_limit
+from magnet.team_permissions import get_teams_for_user
 
 logger = logging.getLogger(__name__)
 
@@ -628,24 +629,20 @@ async def get_memory(request) -> JSONResponse:
 
     teams_out = []
     team_store = _get_team_store()
-    for team_id in team_store.get_teams_for_user(user_id):
+    for team in get_teams_for_user(user_id):
+        team_id = team["id"]
         # Broad catch, matching mcp_server._load_team_items_if_shared's
         # convention: team memory needing real Redis is an expected
         # condition, not an error — skip that team rather than 500ing.
         try:
-            meta = team_store.get_team_meta(team_id) or {}
-            role = next(
-                (m["role"] for m in team_store.list_members(team_id) if m["user_id"] == user_id),
-                "member",
-            )
             projects_out = []
             for shared in team_store.list_shared_projects(team_id):
                 items = team_store.load_team_items(team_id, shared["project"])
                 projects_out.append({"project": shared["project"], "items": [_item_out(i) for i in items]})
             teams_out.append({
                 "team_id": team_id,
-                "name": meta.get("name", team_id),
-                "role": role,
+                "name": team.get("name", team_id),
+                "role": team.get("role", "member"),
                 "projects": projects_out,
             })
         except Exception as e:
