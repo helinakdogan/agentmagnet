@@ -40,9 +40,11 @@ def _get_embedder() -> Any:
             )
             sys.stderr.flush()
         _MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        _embedder = SentenceTransformer(
-            _MODEL_NAME, cache_folder=str(_MODEL_DIR), show_progress_bar=False
-        )
+        # show_progress_bar is an encode()-time argument in current
+        # sentence-transformers, not a constructor kwarg — passing it here
+        # raised a TypeError on newer versions, which silently downgraded
+        # every caller to the keyword-overlap fallback.
+        _embedder = SentenceTransformer(_MODEL_NAME, cache_folder=str(_MODEL_DIR))
         _embedder_available = True
         logger.info(f"[magnet] Local embedder ready: {_MODEL_NAME}")
     except ImportError:
@@ -66,7 +68,7 @@ def embed(text: str) -> list[float] | None:
     if model is None:
         return None
     try:
-        return model.encode(text, normalize_embeddings=True).tolist()
+        return model.encode(text, normalize_embeddings=True, show_progress_bar=False).tolist()
     except Exception as e:
         logger.debug(f"[embedder] encode failed: {e}")
         return None

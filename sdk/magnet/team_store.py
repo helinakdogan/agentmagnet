@@ -446,6 +446,72 @@ def _tn(s: str) -> str:
     return s.strip().lower()
 
 
+def _record_history(
+    team_id: str,
+    item_id: str,
+    user_id: str,
+    action: str,
+    old_text: str | None = None,
+    new_text: str | None = None,
+) -> None:
+    """Best-effort append to memory_history — hosted Postgres only, a silent
+    no-op everywhere else (local/solo mode, or a team on BYO Redis with no
+    Postgres reachable) so a team write never fails because history logging
+    isn't available. Never mutated after insert — append-only, like git
+    history. action is one of: created | edited | superseded | deleted |
+    shared_to_team | promoted."""
+    try:
+        from magnet.postgres_store import get_pool_if_configured
+        pool = get_pool_if_configured()
+        if pool is None:
+            return
+        with pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO memory_history (item_id, team_id, user_id, action, old_text, new_text) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (item_id, team_id, user_id, action, old_text, new_text),
+            )
+    except Exception as e:
+        logger.debug(f"[team] history record failed (non-fatal): {e}")
+
+
+def get_history(team_id: str, item_id: str | None = None, limit: int = 50) -> list[dict]:
+    """Change log for a team, optionally scoped to one item — most recent
+    first. Returns [] outside hosted Postgres mode (same fail-open-to-empty
+    convention as the rest of this module's Postgres-backed reads)."""
+    try:
+        from magnet.postgres_store import get_pool_if_configured
+        pool = get_pool_if_configured()
+        if pool is None:
+            return []
+        with pool.connection() as conn:
+            if item_id:
+                rows = conn.execute(
+                    "SELECT item_id, team_id, user_id, action, old_text, new_text, created_at "
+                    "FROM memory_history WHERE team_id = %s AND item_id = %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (team_id, item_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT item_id, team_id, user_id, action, old_text, new_text, created_at "
+                    "FROM memory_history WHERE team_id = %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (team_id, limit),
+                ).fetchall()
+        return [
+            {
+                "item_id": r[0], "team_id": r[1], "user_id": r[2], "action": r[3],
+                "old_text": r[4], "new_text": r[5],
+                "created_at": r[6].isoformat() if r[6] else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.debug(f"[team] get_history failed: {e}")
+        return []
+
+
 class MagnetTeamStore:
     """
     Team memory DATA store — new category-based format. Requires a real
@@ -533,9 +599,11 @@ class MagnetTeamStore:
         for item in personal_items:
             sig = (item.get("category"), _tn(item.get("text", "")))
             if sig not in existing_sigs:
-                existing.append({**item, "shared_by": user, "shared_at": time.time()})
+                shared_item = {**item, "shared_by": user, "shared_at": time.time()}
+                existing.append(shared_item)
                 existing_sigs.add(sig)
                 added += 1
+                _record_history(team_id, shared_item.get("id", ""), user, "shared_to_team", new_text=shared_item.get("text"))
 
         self.save_team_items(team_id, project, existing)
         self._register_shared_project(team_id, project)
@@ -564,6 +632,7 @@ class MagnetTeamStore:
         existing.append({**item, "shared_by": user_id, "shared_at": time.time()})
         self.save_team_items(team_id, project, existing)
         self._register_shared_project(team_id, project)
+        _record_history(team_id, item_id, user_id, "shared_to_team", new_text=item.get("text"))
         logger.info(f"[team] {user_id} shared item [{item_id}] → team/{team_id}/{project}")
         return {"shared": 1, "item": item["text"][:80], "category": item.get("category")}
 
@@ -621,6 +690,7 @@ class MagnetTeamStore:
         }
         team_items.append(team_item)
         self.save_team_items(team_id, project, team_items)
+        _record_history(team_id, team_item.get("id", ""), current_user, "promoted", new_text=team_item.get("text"))
         logger.info(
             f"[team] auto-promoted [{new_cat}] to team/{team_id}/{project}: {new_text[:60]!r} "
             f"(agreed with {agreed_with.get('shared_by')})"

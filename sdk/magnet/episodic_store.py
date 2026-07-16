@@ -45,9 +45,13 @@ class EpisodicStore:
         qdrant_api_key: Qdrant API key (optional).
 
     Behavior:
-        - With Qdrant: Semantic search + vector storage.
-        - Without Qdrant: Redis sorted set fallback (using importance scores).
-        - Without both: In-memory list (for testing/development).
+        - With Qdrant: semantic search via OpenAI embeddings + vector storage.
+        - Without Qdrant: episodes are stored in Redis (ordered by importance
+          at write time), but recall ranks them against the query using the
+          local on-device embedding model — importance decides what gets
+          kept, semantic similarity decides what's relevant right now.
+        - Without both: same local semantic ranking over an in-memory list
+          (for testing/development).
     """
 
     def __init__(
@@ -154,9 +158,9 @@ class EpisodicStore:
         if self._qdrant_available:
             return self._recall_qdrant(tenant_id, query, top_k)
         elif self._redis:
-            return self._recall_redis(tenant_id, top_k)
+            return self._recall_redis(tenant_id, query, top_k)
         else:
-            return self._recall_memory(tenant_id, top_k)
+            return self._recall_memory(tenant_id, query, top_k)
 
     # ------------------------------------------------------------------
     # Internal — storage backends
@@ -212,23 +216,38 @@ class EpisodicStore:
         except Exception as e:
             logger.error(f"EpisodicStore: Qdrant search error: {e}")
             if self._redis:
-                return self._recall_redis(tenant_id, top_k)
+                return self._recall_redis(tenant_id, query, top_k)
             return []
 
-    def _recall_redis(self, tenant_id: str, top_k: int) -> list[dict]:
-        """Retrieves episodes with the highest importance scores from Redis."""
+    def _recall_redis(self, tenant_id: str, query: str, top_k: int) -> list[dict]:
+        """Ranks stored episodes against the query by semantic similarity
+        using the local (on-device) embedding model — no API key required.
+        Redis just holds the data here; relevance ranking happens in
+        _rank_locally, not from the importance score alone."""
         key = _EPISODIC_KEY_PREFIX + tenant_id
         try:
-            items = self._redis.zrevrange(key, 0, top_k - 1)
-            return [json.loads(i) for i in items]
+            items = self._redis.zrevrange(key, 0, _MAX_EPISODES - 1)
+            episodes = [json.loads(i) for i in items]
         except Exception as e:
             logger.error(f"EpisodicStore: Redis read error: {e}")
             return []
+        return self._rank_locally(query, episodes, top_k)
 
-    def _recall_memory(self, tenant_id: str, top_k: int) -> list[dict]:
-        """Retrieves episodes from the in-memory fallback."""
-        lst = self._memory.get(tenant_id, [])
-        return lst[:top_k]
+    def _recall_memory(self, tenant_id: str, query: str, top_k: int) -> list[dict]:
+        """In-memory fallback — same local semantic ranking as _recall_redis."""
+        episodes = self._memory.get(tenant_id, [])
+        return self._rank_locally(query, episodes, top_k)
+
+    def _rank_locally(self, query: str, episodes: list[dict], top_k: int) -> list[dict]:
+        """Semantic similarity ranking with the local embedding model
+        (sentence-transformers, on-device, no API key) — falls back to a
+        keyword-overlap score if that model isn't installed. Either way,
+        this is a real relevance signal against the query, not a
+        hardcoded-phrase gate deciding whether to look at all."""
+        if not episodes:
+            return []
+        from .local_embeddings import rank_by_similarity
+        return rank_by_similarity(query, episodes, text_key="summary", top_k=top_k)
 
     # ------------------------------------------------------------------
     # Helpers

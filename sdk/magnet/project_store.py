@@ -11,7 +11,8 @@ Stores project memory under a clean three-level hierarchy:
       └── side-thing         →  key: vmm:helin:hobby:side-thing
 
 Key format:   vmm:{user}:{profile}:{project}
-Value:        JSON {"items": [{id, category, text, status, confidence, stored_at}]}
+Value:        JSON {"items": [{id, category, text, status, confidence, stored_at,
+              source_tool, source_transport, created_by, updated_by, updated_at}]}
 
 Index key:    vmm:{user}:__index__
 Value:        JSON {"personal": ["general", "kuika"], "hobby": ["side-thing"]}
@@ -33,9 +34,10 @@ logger = logging.getLogger(__name__)
 _MAX_ENTRIES = 200
 _TTL = 60 * 60 * 24 * 90  # 90 days
 
-CATEGORIES = frozenset({"decision", "convention", "watch_out", "tried_failed", "goal", "preference"})
+CATEGORIES = frozenset({"action", "decision", "convention", "watch_out", "tried_failed", "goal", "preference"})
 
 _LABELS: dict[str, str] = {
+    "action":       "Actions",
     "decision":     "Decisions",
     "convention":   "Conventions",
     "watch_out":    "Watch out",
@@ -44,10 +46,12 @@ _LABELS: dict[str, str] = {
     "preference":   "Preferences",
 }
 
-# Display order matches the spec example (decisions first, preferences last)
-_DISPLAY_ORDER = ["decision", "convention", "watch_out", "tried_failed", "goal", "preference"]
-# Injection order: high-value context first (decisions + goals + watch-outs), preferences last
-_INJECT_ORDER  = ["decision", "goal", "watch_out", "tried_failed", "convention", "preference"]
+# Display order matches the spec example (decisions first, preferences last).
+# Actions lead — what was actually DONE is the highest-value context when
+# resuming work, more reliable than statements of intent.
+_DISPLAY_ORDER = ["action", "decision", "convention", "watch_out", "tried_failed", "goal", "preference"]
+# Injection order: high-value context first (actions + decisions + goals + watch-outs), preferences last
+_INJECT_ORDER  = ["action", "decision", "goal", "watch_out", "tried_failed", "convention", "preference"]
 
 _ID_CHARS = string.ascii_lowercase + string.digits
 
@@ -63,7 +67,11 @@ def _gen_id() -> str:
 
 
 def _add_missing_fields(items: list[dict]) -> bool:
-    """Migrate old items that lack 'id' or 'status'. Returns True if any fields were added."""
+    """Migrate old items that predate id/status, or provenance/attribution
+    fields (source_tool, source_transport, created_by, updated_by,
+    updated_at). Legacy items get "unknown" rather than a guessed value —
+    same fail-closed convention used everywhere else in this codebase.
+    Returns True if any fields were added."""
     changed = False
     for item in items:
         if "id" not in item:
@@ -71,6 +79,21 @@ def _add_missing_fields(items: list[dict]) -> bool:
             changed = True
         if "status" not in item:
             item["status"] = "active"
+            changed = True
+        if "source_tool" not in item:
+            item["source_tool"] = "unknown"
+            changed = True
+        if "source_transport" not in item:
+            item["source_transport"] = "unknown"
+            changed = True
+        if "created_by" not in item:
+            item["created_by"] = "unknown"
+            changed = True
+        if "updated_by" not in item:
+            item["updated_by"] = item.get("created_by", "unknown")
+            changed = True
+        if "updated_at" not in item:
+            item["updated_at"] = item.get("stored_at")
             changed = True
     return changed
 
@@ -175,8 +198,16 @@ class MemoryStore:
         text: str,
         confidence: float = 0.8,
         dedup: bool = True,
+        source_tool: str = "unknown",
+        source_transport: str = "unknown",
     ) -> bool:
-        """Add a memory item. Returns True if saved (False if empty or duplicate)."""
+        """Add a memory item. Returns True if saved (False if empty or duplicate).
+
+        source_tool/source_transport are provenance — which MCP client and
+        which transport this item came from ("claude"/"cursor"/"codex"/
+        "unknown", "stdio"/"http"/"unknown"). Callers should pass "unknown"
+        rather than guess when the actual source isn't determinable.
+        """
         if not text or not text.strip():
             return False
         if category not in CATEGORIES:
@@ -197,13 +228,19 @@ class MemoryStore:
             except Exception:
                 pass
 
+        now = time.time()
         items.append({
             "id": _gen_id(),
             "category": category,
             "text": text.strip(),
             "status": "active",
             "confidence": confidence,
-            "stored_at": time.time(),
+            "stored_at": now,
+            "source_tool": source_tool,
+            "source_transport": source_transport,
+            "created_by": user,
+            "updated_by": user,
+            "updated_at": now,
         })
         self._save(user, profile, project, items)
         logger.info(f"[memory_store] [{category}] saved for {user}/{profile}/{project}")
@@ -227,6 +264,8 @@ class MemoryStore:
                 if item.get("category") != "goal":
                     return None
                 item["status"] = "done"
+                item["updated_by"] = user
+                item["updated_at"] = time.time()
                 self._save(user, profile, project, items)
                 return item
         return None
@@ -342,11 +381,13 @@ class MemoryStore:
                     item_id = item.get("id", "??????")
                     text = item["text"]
                     team_tag = " [team]" if item.get("_team") else ""
+                    source = item.get("source_tool")
+                    source_tag = f" ({source})" if source and source != "unknown" else ""
                     if cat == "goal":
                         status = item.get("status", "active")
-                        lines.append(f"    [{item_id}]{team_tag} {text}  ({status})")
+                        lines.append(f"    [{item_id}]{team_tag} {text}  ({status}){source_tag}")
                     else:
-                        lines.append(f"    [{item_id}]{team_tag} {text}")
+                        lines.append(f"    [{item_id}]{team_tag} {text}{source_tag}")
             else:
                 lines.append("    (none)")
         return "\n".join(lines)
@@ -365,11 +406,13 @@ class MemoryStore:
                 for item in xs[-15:]:
                     item_id = item.get("id", "??????")
                     text = item["text"]
+                    source = item.get("source_tool")
+                    source_tag = f" ({source})" if source and source != "unknown" else ""
                     if cat == "goal":
                         status = item.get("status", "active")
-                        lines.append(f"    [{item_id}] {text}  ({status})")
+                        lines.append(f"    [{item_id}] {text}  ({status}){source_tag}")
                     else:
-                        lines.append(f"    [{item_id}] {text}")
+                        lines.append(f"    [{item_id}] {text}{source_tag}")
             else:
                 lines.append("    (none)")
         return "\n".join(lines)

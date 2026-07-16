@@ -10,7 +10,6 @@ activated per request and merges context from selected layers.
 from __future__ import annotations
 
 import logging
-import re
 from typing import TYPE_CHECKING
 
 from .episodic_store import EpisodicStore
@@ -28,7 +27,16 @@ class MemoryOrchestrator:
     Determines which memory layer operates using rule-based heuristics.
 
     - Behavioral: Always active on every request.
-    - Episodic:   Activated if the query references past interactions.
+    - Episodic:   Always active — relevance is decided by semantic
+                  similarity in EpisodicStore.recall() (local embedding
+                  model, or Qdrant when configured), not by whether the
+                  query happens to contain a hardcoded phrase. A query
+                  that never says "remember when" can still be about a
+                  past conversation; a query that does say it isn't
+                  guaranteed to be. Gating on phrase-matching either
+                  hides real matches or fires on empty ones — semantic
+                  similarity against the actual episode content is the
+                  only signal that means anything here.
     - Knowledge:  Graph-based long-term memory.
 
     Args:
@@ -36,24 +44,6 @@ class MemoryOrchestrator:
         episodic_store:   Instance of EpisodicStore.
         knowledge_store:  Instance of KnowledgeStore.
     """
-
-    # Regex patterns triggering the episodic layer
-    EPISODIC_TRIGGERS: list[str] = [
-        r"\bgeçen\b",
-        r"\bdaha önce\b",
-        r"\bhatırlıyor musun\b",
-        r"\beverything\b",
-        r"\bpreviously\b",
-        r"\blast time\b",
-        r"\brecently\b",
-        r"\bwe discussed\b",
-        r"\byou mentioned\b",
-        r"\bgeçen sefer\b",
-        r"\bönce konuşmuştuk\b",
-        r"\bdo you remember\b",
-        r"\bsöylemiştik\b",
-        r"\bkonuşmuştuk\b",
-    ]
 
     def __init__(
         self,
@@ -64,10 +54,6 @@ class MemoryOrchestrator:
         self._behavioral = behavioral_store
         self._episodic = episodic_store
         self._knowledge = knowledge_store
-        self._episodic_re = re.compile(
-            "|".join(self.EPISODIC_TRIGGERS),
-            re.IGNORECASE,
-        )
 
     # ------------------------------------------------------------------
     # Core Decision Logic
@@ -75,22 +61,23 @@ class MemoryOrchestrator:
 
     def decide(self, query: str, tenant_id: str) -> dict[str, bool]:
         """
-        Decides which layers to activate based on the incoming query.
+        Decides which layers to activate. Behavioral and episodic are both
+        always active — episodic relevance is filtered by semantic
+        similarity inside EpisodicStore.recall() itself, not by whether
+        this query happens to match a hardcoded phrase.
 
         Args:
             query:     The user's latest message.
             tenant_id: Tenant ID in ``project_id:user_id`` format.
 
         Returns:
-            Dict: ``{"behavioral": True, "episodic": bool, "knowledge": bool}``
+            Dict: ``{"behavioral": True, "episodic": True, "knowledge": bool}``
         """
-        use_episodic = bool(self._episodic_re.search(query))
-
         use_knowledge = False
 
         decision = {
             "behavioral": True,
-            "episodic": use_episodic,
+            "episodic": True,
             "knowledge": use_knowledge,
         }
 
@@ -143,7 +130,8 @@ class MemoryOrchestrator:
                 if behavioral_ctx:
                     context_parts.append(behavioral_ctx)
 
-        # ── Layer 2: Episodic (conditional) ───────────────────────────
+        # ── Layer 2: Episodic (always active — recall() itself filters
+        #    for relevance by semantic similarity) ────────────────────
         if decision["episodic"]:
             episodes = self._episodic.recall(tenant_id, query, top_k=2)
             if episodes:

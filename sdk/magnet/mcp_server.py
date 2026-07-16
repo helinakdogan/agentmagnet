@@ -109,6 +109,37 @@ def _in_hosted_request() -> bool:
     return _user_id_ctx.get() is not _UNSET
 
 
+# ── Provenance (which MCP client + transport a memory item came from) ───────
+#
+# The MCP protocol runs the same `initialize` handshake regardless of
+# transport, and the underlying SDK's ServerSession stores the client's
+# clientInfo from that handshake even in stateless HTTP mode — so this
+# works for both stdio and HTTP without any changes to http_server.py's
+# auth middleware. clientInfo.name is client-supplied, unauthenticated data
+# (same trust level as a User-Agent header): a hint, never identity. "unknown"
+# beats a wrong guess, same fail-closed convention as everything else here.
+
+def _current_source_tool() -> str:
+    try:
+        session = app.request_context.session
+        client_params = getattr(session, "client_params", None)
+        name = (client_params.clientInfo.name if client_params else "") or ""
+    except Exception:
+        return "unknown"
+    name = name.lower()
+    if "claude" in name:
+        return "claude"
+    if "cursor" in name:
+        return "cursor"
+    if "codex" in name:
+        return "codex"
+    return "unknown"
+
+
+def _current_source_transport() -> str:
+    return "http" if _in_hosted_request() else "stdio"
+
+
 # ── Active context ────────────────────────────────────────────────────────────
 
 def _read_active_context() -> dict:
@@ -195,22 +226,26 @@ def _write_rhythm(profile: str, project: str, **updates: Any) -> None:
         logger.debug(f"[rhythm] write failed: {e}")
 
 
-# Keywords that indicate a user message has a real preference worth saving
-_PREFERENCE_TRIGGERS = frozenset({
-    "prefer", "like", "don't like", "dislike", "hate", "love", "want",
-    "always", "never", "use ", "using ", "tercih", "kullan", "sev",
-    "istemiyorum", "kullanıyoruz", "yapıyoruz", "kullanmak",
-})
-
-
 async def _extract_from_messages(
     messages: list[dict], user: str, profile: str, project: str
 ) -> tuple[int, bool]:
     """Extract project-relevant insights from a message window and save to
     MemoryStore. Returns (saved_count, cap_hit) — cap_hit is always False
-    outside hosted mode."""
-    from magnet.local_extractor import detect_category
+    outside hosted mode.
+
+    Whether a message is worth saving is decided entirely by the extractor
+    (detect_category returning a real category vs None) plus MemoryStore's
+    own semantic dedup at write time — not by a hardcoded phrase whitelist.
+    A keyword list gating what gets captured has the same flaw a keyword
+    list gating what gets recalled has: it makes capture depend on exact
+    wording, in whatever languages someone remembered to list, maintained
+    by hand forever. If a signal is genuinely useful it can inform
+    confidence; it must never be the sole reason something is or isn't
+    saved."""
+    from magnet.local_extractor import detect_category, compress_essence
     store = _get_memory_store()
+    source_tool = _current_source_tool()
+    source_transport = _current_source_transport()
     saved = 0
     cap_hit = False
     for msg in messages:
@@ -221,14 +256,16 @@ async def _extract_from_messages(
             continue
         text = text[:400]
         category = detect_category(text)
-        if category == "preference":
-            text_lower = text.lower()
-            if not any(kw in text_lower for kw in _PREFERENCE_TRIGGERS):
-                continue
+        if category is None:
+            continue
+        text = compress_essence(text)
         if await _memory_cap_check(user):
             cap_hit = True
             break
-        added = await asyncio.to_thread(store.add_entry, user, profile, project, category, text)
+        added = await asyncio.to_thread(
+            store.add_entry, user, profile, project, category, text,
+            source_tool=source_tool, source_transport=source_transport,
+        )
         if added:
             saved += 1
             await _record_memory_delta(user, 1)
@@ -376,6 +413,7 @@ async def _load_team_items_if_shared(project: str, team_id: str) -> list[dict]:
 # ── Signal type → storage category ───────────────────────────────────────────
 
 _SIGNAL_TO_CATEGORY = {
+    "action":            "action",
     "decision":          "decision",
     "watch_out":         "watch_out",
     "tried_failed":      "tried_failed",
@@ -420,14 +458,23 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="remember",
             description=(
-                "Call AUTOMATICALLY, in the background, the moment the user states:\n"
+                "Call AUTOMATICALLY, in the background, the moment the user states — or you "
+                "complete — one of these:\n"
+                "  action        — work that was ACTUALLY DONE, not proposed: 'renamed X to Y', "
+                "'switched the db layer to Postgres', 'added rate limiting to /mcp'. "
+                "Only for completed work — 'let's maybe try X' is NOT an action.\n"
                 "  decision      — 'I decided to X', 'we're going with Y', 'let's use Z'\n"
                 "  watch_out     — 'be careful about X', 'don't forget Y', 'this breaks if...'\n"
                 "  tried_failed  — 'we tried X and it broke / didn't work'\n"
                 "  convention    — 'we always use X', 'components go in /ui/'\n"
                 "  goal          — 'we're building X', 'the aim is Y'\n"
                 "  preference    — 'I prefer X', 'I like X', 'I don't like Y'\n"
-                "Pass the extracted insight as 'text' (one clear sentence). "
+                "Pass the extracted insight as 'text', telegraphically: subject + action/object + "
+                "constraint, under ~15 words, no filler or hedging. Preserve WHY when it's short "
+                "('dropped Chart.js: too heavy' beats 'dropped Chart.js'). Never store code — if the "
+                "context involves code, store the decision plus a file/function pointer instead "
+                "('auth refresh lives in auth.py:refresh_token; breaks if expiry changes'), not the "
+                "code itself. "
                 "Never announce that you are calling this. Saves to the ACTIVE project. "
                 "Every response confirms with (profile / project)."
             ),
@@ -436,7 +483,7 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "The insight to save — one clear sentence (preferred over 'messages')",
+                        "description": "The insight to save — telegraphic, under ~15 words, no code (preferred over 'messages')",
                     },
                     "messages": {
                         "type": "array",
@@ -453,7 +500,7 @@ async def list_tools() -> list[types.Tool]:
                     "signal_type": {
                         "type": "string",
                         "enum": [
-                            "decision", "watch_out", "tried_failed", "convention", "goal",
+                            "action", "decision", "watch_out", "tried_failed", "convention", "goal",
                             "preference", "preference_like", "preference_dislike",
                             "correction", "rejection", "tone_preference",
                         ],
@@ -470,7 +517,7 @@ async def list_tools() -> list[types.Tool]:
             name="show_project_memory",
             description=(
                 "Show an organized view of the active project's memory, grouped by: "
-                "goals, decisions, watch-outs, tried & failed, conventions, preferences. "
+                "actions, decisions, conventions, watch-outs, tried & failed, goals, preferences. "
                 "Call when the user wants to review what has been saved."
             ),
             inputSchema={
@@ -684,6 +731,24 @@ async def list_tools() -> list[types.Tool]:
                 "required": [],
             },
         ),
+        # ── TEAM: history ──────────────────────────────────────────────────────
+        types.Tool(
+            name="history",
+            description=(
+                "Show the change log for a team item, or the whole team if no item_id is given: "
+                "who changed what, when, from what to what. Plain text, most recent first. "
+                "Team-only — git-blame-style attribution for shared memory. Call when the user "
+                "asks 'who changed this', 'when was this shared', or 'show history'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string", "description": "The 6-char item id to scope history to (omit for the whole team)"},
+                    "team_id": {"type": "string", "description": "Team id (defaults to MAGNET_TEAM_ID)"},
+                },
+                "required": [],
+            },
+        ),
         # ── PRIMARY: recap (*recap) ───────────────────────────────────────────
         types.Tool(
             name="recap",
@@ -692,8 +757,10 @@ async def list_tools() -> list[types.Tool]:
                 "'what were we doing', 'catch me up', 'remind me where we left off', "
                 "or types '*recap'. "
                 "Pulls all memory for the active project and returns a natural prose summary — "
-                "like a helpful teammate catching you up: what we were building, key decisions, "
-                "things to watch out for, and what's still open. "
+                "like a helpful teammate catching you up. Lead with what was actually DONE "
+                "(actions) — that's more reliable than what was said and the most useful thing "
+                "for resuming work — then key decisions, things to watch out for, and what's "
+                "still open. "
                 "NEVER return a raw category list — deliver this as a human narrative."
             ),
             inputSchema={
@@ -827,8 +894,8 @@ async def list_tools() -> list[types.Tool]:
                 f"RHYTHM-BASED AUTO-SAVE — call silently every ~{_SAVE_EVERY} user turns. "
                 "Count user messages in the conversation. When the count reaches "
                 f"~{_SAVE_EVERY}, call this tool (pass the recent messages), then reset your count. "
-                "Extracts decisions, preferences, and watch-outs from the window and saves to "
-                "the active project. "
+                "Extracts actions taken, decisions, preferences, and watch-outs from the window "
+                "and saves to the active project. "
                 "Do NOT announce this to the user — fold it silently into your response. "
                 "A one-line note is acceptable if it flows naturally."
             ),
@@ -918,7 +985,7 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "signal_type": {
                         "type": "string",
-                        "enum": ["decision", "watch_out", "tried_failed", "convention", "goal",
+                        "enum": ["action", "decision", "watch_out", "tried_failed", "convention", "goal",
                                  "correction", "rejection", "preference_like", "preference_dislike", "tone_preference"],
                     },
                 },
@@ -1144,6 +1211,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 team_id=arguments.get("team_id"),
                 project=arguments.get("project"),
             )
+        elif name == "history":
+            result = await _handle_history(
+                item_id=arguments.get("item_id"),
+                team_id=arguments.get("team_id"),
+            )
         elif name == "recap":
             result = await _handle_recap(
                 profile=arguments.get("profile"),
@@ -1272,6 +1344,8 @@ async def _handle_remember(
     profile: str | None = None,
     project: str | None = None,
 ) -> str:
+    from magnet.local_extractor import compress_essence
+
     user, profile, project = _resolve_context(profile, project)
     store = _get_memory_store()
     usage = _get_usage_counter()
@@ -1288,12 +1362,20 @@ async def _handle_remember(
     if not extracted:
         return f"Nothing to save. {_ctx_tag(profile, project)}"
 
+    # Essence compression is a backstop here, not the primary mechanism —
+    # the tool description already instructs the calling model to write
+    # telegraphically. This guarantees the cap holds even if it doesn't.
+    extracted = compress_essence(extracted)
+
     cap_msg = await _memory_cap_check(user)
     if cap_msg:
         return f"{cap_msg} {_ctx_tag(profile, project)}"
 
     category = _SIGNAL_TO_CATEGORY.get(signal_type, "preference")
-    saved = await asyncio.to_thread(store.add_entry, user, profile, project, category, extracted)
+    saved = await asyncio.to_thread(
+        store.add_entry, user, profile, project, category, extracted,
+        source_tool=_current_source_tool(), source_transport=_current_source_transport(),
+    )
     if saved:
         await _record_memory_delta(user, 1)
     usage.record_write(project)
@@ -1759,8 +1841,45 @@ async def _handle_get_team_memory(
         return f"Could not load team memory: {e}"
 
 
+async def _handle_history(
+    item_id: str | None = None,
+    team_id: str | None = None,
+) -> str:
+    tid = team_id or _current_team_id()
+    if not tid:
+        return "No team set. History is a team feature — use *team new <name> to create one first."
+    from magnet.team_permissions import check_team_permission, team_permission_denied_message
+    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "history")
+    if team is None:
+        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
+
+    from magnet.team_store import get_history
+    rows = await asyncio.to_thread(get_history, tid, item_id, 50)
+    if not rows:
+        scope = f"item {item_id}" if item_id else f"team {tid}"
+        return f"No history yet for {scope}."
+
+    scope_label = f"item {item_id}" if item_id else f"team {tid}"
+    lines = [f"History — {scope_label}:"]
+    for r in rows:
+        when = r["created_at"] or "?"
+        who = r["user_id"]
+        action = r["action"]
+        if r.get("new_text") and r.get("old_text"):
+            detail = f'"{r["old_text"][:60]}" → "{r["new_text"][:60]}"'
+        elif r.get("new_text"):
+            detail = f'"{r["new_text"][:80]}"'
+        elif r.get("old_text"):
+            detail = f'"{r["old_text"][:80]}"'
+        else:
+            detail = ""
+        lines.append(f"  [{when}] {who} — {action} [{r['item_id']}] {detail}".rstrip())
+    return "\n".join(lines)
+
+
 def _recap_template(project: str, profile: str, by_cat: dict) -> str:
     """Template-based recap when no LLM key is available."""
+    actions      = [t for t, _ in by_cat.get("action", [])]
     active_goals = [t for t, s in by_cat.get("goal", []) if s == "active"]
     done_goals   = [t for t, s in by_cat.get("goal", []) if s == "done"]
     decisions    = [t for t, _ in by_cat.get("decision", [])]
@@ -1775,6 +1894,14 @@ def _recap_template(project: str, profile: str, by_cat: dict) -> str:
         parts.append(f"Last time on {project}: making progress on the build.")
     else:
         parts.append(f"Last time on {project}: getting started.")
+
+    # Actions lead — what was actually done is the most useful thing for
+    # resuming work, more reliable than what was said.
+    if actions:
+        if len(actions) == 1:
+            parts.append(f"Last done: {actions[0]}.")
+        else:
+            parts.append(f"Recently done: {'; '.join(actions[-5:])}.")
 
     if decisions:
         if len(decisions) == 1:
@@ -1799,6 +1926,7 @@ async def _recap_with_llm(project: str, profile: str, by_cat: dict, openai_key: 
     """LLM-synthesized recap — natural prose, like a teammate catching you up."""
     import litellm
 
+    actions      = [t for t, _ in by_cat.get("action", [])][-8:]
     active_goals = [t for t, s in by_cat.get("goal", []) if s == "active"]
     done_goals   = [t for t, s in by_cat.get("goal", []) if s == "done"]
     decisions    = [t for t, _ in by_cat.get("decision", [])][-6:]
@@ -1808,6 +1936,7 @@ async def _recap_with_llm(project: str, profile: str, by_cat: dict, openai_key: 
     preferences  = [t for t, _ in by_cat.get("preference", [])][-3:]
 
     sections: list[str] = []
+    if actions:       sections.append("Actually done: " + "; ".join(actions))
     if active_goals:  sections.append("Open goals: " + "; ".join(active_goals))
     if done_goals:    sections.append("Completed goals: " + "; ".join(done_goals))
     if decisions:     sections.append("Decisions made: " + "; ".join(decisions))
@@ -1820,8 +1949,10 @@ async def _recap_with_llm(project: str, profile: str, by_cat: dict, openai_key: 
     prompt = (
         f"You are catching up a developer on their '{project}' project. "
         "Write a brief 2-4 sentence recap, like a helpful teammate. "
-        "Lead with what they were building, mention the key decisions made, "
-        "flag any watch-outs or failed approaches, and end with the open goal or next step. "
+        "Lead with what was actually DONE (the 'Actually done' items are completed work, "
+        "more reliable than stated intentions) — that's the most useful thing for resuming "
+        "work — then mention the key decisions made, flag any watch-outs or failed approaches, "
+        "and end with the open goal or next step. "
         "Sound natural and conversational — NOT like a bullet list or database report.\n\n"
         f"Memory:\n{memory_text}\n\nRecap:"
     )
@@ -1891,7 +2022,7 @@ async def _handle_show_all_memory(
             return "No memory yet. Say *profiles to create your first profile."
 
         _cat_labels = {
-            "decision": "decision", "goal": "goal", "watch_out": "watch-out",
+            "action": "action", "decision": "decision", "goal": "goal", "watch_out": "watch-out",
             "tried_failed": "tried & failed", "convention": "convention",
             "preference": "preference",
         }
@@ -1911,7 +2042,7 @@ async def _handle_show_all_memory(
                     c = it.get("category", "preference")
                     counts[c] = counts.get(c, 0) + 1
                 parts = []
-                for cat in ["decision", "goal", "watch_out", "tried_failed", "convention", "preference"]:
+                for cat in ["action", "decision", "goal", "watch_out", "tried_failed", "convention", "preference"]:
                     n = counts.get(cat, 0)
                     if n:
                         lbl = _cat_labels[cat]
@@ -2193,9 +2324,11 @@ async def _handle_save_session(
 async def _promote_summary_to_memory(
     summary: str, user: str, profile: str, project: str, store: Any
 ) -> None:
-    from magnet.local_extractor import detect_category
+    from magnet.local_extractor import detect_category, compress_essence
 
-    project_categories = frozenset({"decision", "watch_out", "tried_failed", "convention", "goal"})
+    project_categories = frozenset({"action", "decision", "watch_out", "tried_failed", "convention", "goal"})
+    source_tool = _current_source_tool()
+    source_transport = _current_source_transport()
     for line in summary.splitlines():
         text = line.strip().lstrip("-•*").strip()
         if len(text) < 10:
@@ -2204,8 +2337,12 @@ async def _promote_summary_to_memory(
         if cat in project_categories:
             if await _memory_cap_check(user):
                 break
+            text = compress_essence(text)
             try:
-                added = await asyncio.to_thread(store.add_entry, user, profile, project, cat, text)
+                added = await asyncio.to_thread(
+                    store.add_entry, user, profile, project, cat, text,
+                    source_tool=source_tool, source_transport=source_transport,
+                )
                 if added:
                     await _record_memory_delta(user, 1)
             except Exception as e:

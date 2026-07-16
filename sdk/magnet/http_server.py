@@ -602,6 +602,8 @@ def _item_out(item: dict) -> dict:
     team-shared (shared_at) items."""
     ts = item.get("stored_at", item.get("shared_at"))
     created_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
+    updated_ts = item.get("updated_at")
+    updated_at = datetime.fromtimestamp(updated_ts, tz=timezone.utc).isoformat() if updated_ts else created_at
     return {
         "id": item.get("id"),
         "category": item.get("category"),
@@ -610,6 +612,11 @@ def _item_out(item: dict) -> dict:
         "status": item.get("status", "active"),
         "created_at": created_at,
         "shared_by": item.get("shared_by"),
+        "source_tool": item.get("source_tool", "unknown"),
+        "source_transport": item.get("source_transport", "unknown"),
+        "created_by": item.get("created_by", item.get("shared_by", "unknown")),
+        "updated_by": item.get("updated_by", item.get("shared_by", "unknown")),
+        "updated_at": updated_at,
     }
 
 
@@ -665,6 +672,30 @@ async def delete_memory_item(request) -> JSONResponse:
                 return JSONResponse({"ok": True})
 
     return JSONResponse({"error": "not_found", "message": "Memory item not found."}, status_code=404)
+
+
+async def get_memory_history(request) -> JSONResponse:
+    """Dashboard-facing change log for a team item (or the whole team) —
+    git-blame-style. Requires actual team membership, same as every other
+    team route here; never trusts a client-supplied team_id without
+    checking check_team_permission first."""
+    user_id = await _require_user(request)
+    if isinstance(user_id, JSONResponse):
+        return user_id
+
+    team_id = request.query_params.get("team_id")
+    if not team_id:
+        return JSONResponse({"error": "bad_request", "message": "team_id is required."}, status_code=400)
+
+    from magnet.team_permissions import check_team_permission
+    team = check_team_permission(user_id, team_id, "history")
+    if team is None:
+        return JSONResponse({"error": "forbidden", "message": "Not a member of this team."}, status_code=403)
+
+    item_id = request.query_params.get("item_id")
+    from magnet.team_store import get_history
+    rows = get_history(team_id, item_id, limit=100)
+    return JSONResponse({"history": rows})
 
 
 # ── Team dashboard routes ───────────────────────────────────────────────────
@@ -860,6 +891,7 @@ def build_app() -> Starlette:
             Route("/api/keys/{key_id}", revoke_key, methods=["DELETE"]),
             Route("/api/usage", get_usage, methods=["GET"]),
             Route("/api/memory", get_memory, methods=["GET"]),
+            Route("/api/memory/history", get_memory_history, methods=["GET"]),
             Route("/api/memory/{item_id}", delete_memory_item, methods=["DELETE"]),
             Route("/api/teams", list_teams_route, methods=["GET"]),
             Route("/api/teams", create_team_route, methods=["POST"]),
