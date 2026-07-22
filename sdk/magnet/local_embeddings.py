@@ -4,7 +4,7 @@ LocalEmbedder
 On-device semantic embeddings using sentence-transformers (all-MiniLM-L6-v2).
 No API key required. Model is downloaded once to ~/.agent-magnet/models/ on first use.
 
-Falls back to BM25-style keyword matching if sentence-transformers is not installed
+Falls back to keyword-overlap matching if sentence-transformers is not installed
 or the model cannot be downloaded (offline first run).
 """
 
@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 _MODEL_NAME = "all-MiniLM-L6-v2"
 _MODEL_DIR = Path.home() / ".agent-magnet" / "models"
+
+# Normalized MiniLM cosine scores below this point are too weak to justify
+# injecting a past episode into the current prompt. The keyword fallback uses
+# a different scale and therefore only requires at least one overlapping term.
+_MIN_EMBEDDING_SIMILARITY = 0.25
 
 _embedder: Any = None
 _embedder_available: bool | None = None  # None = not yet tried
@@ -112,6 +117,25 @@ def is_semantic_duplicate(text: str, candidates: list[str], threshold: float = 0
     return False
 
 
+def _rank_by_keyword(
+    query: str,
+    documents: list[dict],
+    text_key: str,
+    top_k: int,
+) -> list[dict]:
+    """Rank by word overlap and exclude documents with no shared terms."""
+    q_words = set(re.findall(r"\w+", query.lower()))
+    scored: list[tuple[float, dict]] = []
+    for doc in documents:
+        doc_text = doc.get(text_key, "").lower()
+        doc_words = set(re.findall(r"\w+", doc_text))
+        hits = sum(1 for word in q_words if word in doc_words)
+        score = hits / (math.log(max(len(doc_words), 1)) + 1)
+        scored.append((score, doc))
+    scored.sort(key=lambda item: -item[0])
+    return [doc for score, doc in scored if score > 0][:top_k]
+
+
 def rank_by_similarity(
     query: str,
     documents: list[dict],
@@ -120,7 +144,7 @@ def rank_by_similarity(
 ) -> list[dict]:
     """
     Rank documents by similarity to query.
-    Uses embedding vectors when available; keyword BM25-style when not.
+    Uses embedding vectors when available; keyword overlap when not.
     """
     if not documents:
         return []
@@ -128,22 +152,12 @@ def rank_by_similarity(
     model = _get_embedder()
 
     if model is None:
-        # BM25-style keyword fallback
-        q_words = set(re.findall(r"\w+", query.lower()))
-        scored: list[tuple[float, dict]] = []
-        for doc in documents:
-            doc_text = doc.get(text_key, "").lower()
-            doc_words = set(re.findall(r"\w+", doc_text))
-            hits = sum(1 for w in q_words if w in doc_text)
-            score = hits / (math.log(max(len(doc_words), 1)) + 1)
-            scored.append((score, doc))
-        scored.sort(key=lambda x: -x[0])
-        return [d for _, d in scored[:top_k]]
+        return _rank_by_keyword(query, documents, text_key, top_k)
 
     try:
         q_vec = embed(query)
         if q_vec is None:
-            return documents[:top_k]
+            return _rank_by_keyword(query, documents, text_key, top_k)
         scored_vecs: list[tuple[float, dict]] = []
         for doc in documents:
             d_vec = doc.get("_embedding") or embed(doc.get(text_key, ""))
@@ -152,7 +166,10 @@ def rank_by_similarity(
             else:
                 scored_vecs.append((0.0, doc))
         scored_vecs.sort(key=lambda x: -x[0])
-        return [d for _, d in scored_vecs[:top_k]]
+        return [
+            d for score, d in scored_vecs
+            if score >= _MIN_EMBEDDING_SIMILARITY
+        ][:top_k]
     except Exception as e:
         logger.debug(f"[embedder] rank_by_similarity failed: {e}")
-        return documents[:top_k]
+        return _rank_by_keyword(query, documents, text_key, top_k)
