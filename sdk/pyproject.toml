@@ -21,6 +21,7 @@ dependencies = [
     "neo4j",
     "python-dotenv",
     "sentence-transformers>=2.2",
+    "uvicorn",
 ]
 
 [project.urls]
