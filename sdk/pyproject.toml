@@ -22,6 +22,7 @@ dependencies = [
     "neo4j",
     "python-dotenv",
     "sentence-transformers>=2.2",
+    "uvicorn",
     "PyJWT[crypto]>=2.8",
     "cryptography>=42.0",
 ]
