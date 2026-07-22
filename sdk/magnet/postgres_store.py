@@ -132,8 +132,10 @@ class PostgresBackend:
                     key    TEXT NOT NULL,
                     field  TEXT NOT NULL,
                     value  TEXT NOT NULL,
+                    expires_at DOUBLE PRECISION,
                     PRIMARY KEY (key, field)
                 );
+                ALTER TABLE hashes ADD COLUMN IF NOT EXISTS expires_at DOUBLE PRECISION;
             """)
 
     def ping(self) -> bool:
@@ -184,19 +186,21 @@ class PostgresBackend:
         return sum(1 for k in keys if self.get(k) is not None)
 
     def expire(self, key: str, seconds: int) -> bool:
-        # hashes has no expires_at column (matches SQLiteBackend, which also
-        # only tracks TTL on kv/lists/zsets — hset/hincrby callers don't rely on expiry).
         expires_at = time.time() + seconds
         with self._pool.connection() as conn:
             conn.execute("UPDATE kv SET expires_at = %s WHERE key = %s", (expires_at, key))
             conn.execute("UPDATE lists SET expires_at = %s WHERE key = %s", (expires_at, key))
             conn.execute("UPDATE zsets SET expires_at = %s WHERE key = %s", (expires_at, key))
+            conn.execute("UPDATE hashes SET expires_at = %s WHERE key = %s", (expires_at, key))
         return True
 
     def incr(self, key: str) -> int:
-        """Not present on SQLiteBackend — added for PostgresBackend because
-        aggregate_store.py's pipe.incr(key) needs it in hosted mode."""
+        """Increment a string counter, resetting an expired value."""
         with self._pool.connection() as conn:
+            conn.execute(
+                "DELETE FROM kv WHERE key = %s AND expires_at IS NOT NULL AND expires_at <= %s",
+                (key, time.time()),
+            )
             row = conn.execute(
                 """
                 INSERT INTO kv (key, value, expires_at) VALUES (%s, '1', NULL)
@@ -211,6 +215,7 @@ class PostgresBackend:
 
     def rpush(self, key: str, *values: str) -> int:
         with self._pool.connection() as conn:
+            self._purge_expired_collections(conn, key)
             max_pos = conn.execute(
                 "SELECT COALESCE(MAX(position), -1) FROM lists WHERE key = %s", (key,)
             ).fetchone()[0]
@@ -223,6 +228,7 @@ class PostgresBackend:
 
     def lpush(self, key: str, *values: str) -> int:
         with self._pool.connection() as conn:
+            self._purge_expired_collections(conn, key)
             min_pos = conn.execute(
                 "SELECT COALESCE(MIN(position), 0) FROM lists WHERE key = %s", (key,)
             ).fetchone()[0]
@@ -235,10 +241,12 @@ class PostgresBackend:
 
     def llen(self, key: str) -> int:
         with self._pool.connection() as conn:
+            self._purge_expired_collections(conn, key)
             return conn.execute("SELECT COUNT(*) FROM lists WHERE key = %s", (key,)).fetchone()[0]
 
     def lrange(self, key: str, start: int, end: int) -> list[str]:
         with self._pool.connection() as conn:
+            self._purge_expired_collections(conn, key)
             rows = conn.execute(
                 "SELECT value FROM lists WHERE key = %s ORDER BY position", (key,)
             ).fetchall()
@@ -249,6 +257,7 @@ class PostgresBackend:
 
     def ltrim(self, key: str, start: int, end: int) -> None:
         with self._pool.connection() as conn:
+            self._purge_expired_collections(conn, key)
             rows = conn.execute(
                 "SELECT id FROM lists WHERE key = %s ORDER BY position", (key,)
             ).fetchall()
@@ -268,6 +277,7 @@ class PostgresBackend:
         DEL' script only — not a general Lua interpreter."""
         key = keys_and_args[0]
         with self._pool.connection() as conn:
+            self._purge_expired_collections(conn, key)
             rows = conn.execute(
                 "SELECT value FROM lists WHERE key = %s ORDER BY position", (key,)
             ).fetchall()
@@ -282,6 +292,7 @@ class PostgresBackend:
 
     def zadd(self, key: str, mapping: dict) -> int:
         with self._pool.connection() as conn:
+            self._purge_expired_collections(conn, key)
             for member, score in mapping.items():
                 conn.execute(
                     """
@@ -294,6 +305,7 @@ class PostgresBackend:
 
     def zrevrange(self, key: str, start: int, end: int) -> list[str]:
         with self._pool.connection() as conn:
+            self._purge_expired_collections(conn, key)
             rows = conn.execute(
                 "SELECT member FROM zsets WHERE key = %s ORDER BY score DESC", (key,)
             ).fetchall()
@@ -304,6 +316,7 @@ class PostgresBackend:
 
     def zrange(self, key: str, start: int, end: int) -> list[str]:
         with self._pool.connection() as conn:
+            self._purge_expired_collections(conn, key)
             rows = conn.execute(
                 "SELECT member FROM zsets WHERE key = %s ORDER BY score ASC", (key,)
             ).fetchall()
@@ -314,6 +327,7 @@ class PostgresBackend:
 
     def zremrangebyrank(self, key: str, start: int, end: int) -> int:
         with self._pool.connection() as conn:
+            self._purge_expired_collections(conn, key)
             rows = conn.execute(
                 "SELECT member FROM zsets WHERE key = %s ORDER BY score ASC", (key,)
             ).fetchall()
@@ -332,15 +346,17 @@ class PostgresBackend:
 
     def zcard(self, key: str) -> int:
         with self._pool.connection() as conn:
+            self._purge_expired_collections(conn, key)
             return conn.execute("SELECT COUNT(*) FROM zsets WHERE key = %s", (key,)).fetchone()[0]
 
     # ── Hash ops ─────────────────────────────────────────────────────────
 
     def hset(self, key: str, field: str, value: str) -> None:
         with self._pool.connection() as conn:
+            self._purge_expired_hash(conn, key)
             conn.execute(
                 """
-                INSERT INTO hashes (key, field, value) VALUES (%s, %s, %s)
+                INSERT INTO hashes (key, field, value, expires_at) VALUES (%s, %s, %s, NULL)
                 ON CONFLICT (key, field) DO UPDATE SET value = excluded.value
                 """,
                 (key, field, value),
@@ -348,14 +364,16 @@ class PostgresBackend:
 
     def hgetall(self, key: str) -> dict:
         with self._pool.connection() as conn:
+            self._purge_expired_hash(conn, key)
             rows = conn.execute("SELECT field, value FROM hashes WHERE key = %s", (key,)).fetchall()
         return {field: value for field, value in rows}
 
     def hincrby(self, key: str, field: str, amount: int) -> int:
         with self._pool.connection() as conn:
+            self._purge_expired_hash(conn, key)
             row = conn.execute(
                 """
-                INSERT INTO hashes (key, field, value) VALUES (%s, %s, %s)
+                INSERT INTO hashes (key, field, value, expires_at) VALUES (%s, %s, %s, NULL)
                 ON CONFLICT (key, field) DO UPDATE SET value = (hashes.value::bigint + %s)::text
                 RETURNING value::bigint
                 """,
@@ -377,6 +395,25 @@ class PostgresBackend:
             if expires_at is not None and now > expires_at:
                 continue
             yield key
+
+    @staticmethod
+    def _purge_expired_collections(conn: Any, key: str) -> None:
+        now = time.time()
+        conn.execute(
+            "DELETE FROM lists WHERE key = %s AND expires_at IS NOT NULL AND expires_at <= %s",
+            (key, now),
+        )
+        conn.execute(
+            "DELETE FROM zsets WHERE key = %s AND expires_at IS NOT NULL AND expires_at <= %s",
+            (key, now),
+        )
+
+    @staticmethod
+    def _purge_expired_hash(conn: Any, key: str) -> None:
+        conn.execute(
+            "DELETE FROM hashes WHERE key = %s AND expires_at IS NOT NULL AND expires_at <= %s",
+            (key, time.time()),
+        )
 
 
 class _PgPipeline:
@@ -408,6 +445,14 @@ class _PgPipeline:
 
     def incr(self, key: str) -> "_PgPipeline":
         self._ops.append(("incr", key))
+        return self
+
+    def delete(self, *keys: str) -> "_PgPipeline":
+        self._ops.append(("delete", *keys))
+        return self
+
+    def hset(self, key: str, field: str, value: str) -> "_PgPipeline":
+        self._ops.append(("hset", key, field, value))
         return self
 
     def execute(self) -> list:

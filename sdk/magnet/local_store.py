@@ -63,6 +63,19 @@ class SQLiteBackend:
     def ping(self) -> bool:
         return True
 
+    def _purge_expired_collections(self, key: str) -> None:
+        """Remove expired list and sorted-set rows before collection access."""
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM lists WHERE key = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+                (key, now),
+            )
+            self._conn.execute(
+                "DELETE FROM zsets WHERE key = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+                (key, now),
+            )
+
     # ── String ops ─────────────────────────────────────────────────────
 
     def get(self, key: str) -> str | None:
@@ -95,9 +108,28 @@ class SQLiteBackend:
         with self._lock, self._conn:
             for key in keys:
                 count += self._conn.execute("DELETE FROM kv WHERE key = ?", (key,)).rowcount
+                count += self._conn.execute(
+                    "DELETE FROM kv WHERE key = ?", (f"__hash__{key}",)
+                ).rowcount
                 count += self._conn.execute("DELETE FROM lists WHERE key = ?", (key,)).rowcount
                 count += self._conn.execute("DELETE FROM zsets WHERE key = ?", (key,)).rowcount
         return count
+
+    def incr(self, key: str) -> int:
+        now = time.time()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT value, expires_at FROM kv WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None or (row[1] is not None and row[1] <= now):
+                new_value, expires_at = 1, None
+            else:
+                new_value, expires_at = int(row[0]) + 1, row[1]
+            self._conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value, expires_at) VALUES (?, ?, ?)",
+                (key, str(new_value), expires_at),
+            )
+        return new_value
 
     def exists(self, *keys: str) -> int:
         return sum(1 for k in keys if self.get(k) is not None)
@@ -106,6 +138,10 @@ class SQLiteBackend:
         expires_at = time.time() + seconds
         with self._lock, self._conn:
             self._conn.execute("UPDATE kv SET expires_at = ? WHERE key = ?", (expires_at, key))
+            self._conn.execute(
+                "UPDATE kv SET expires_at = ? WHERE key = ?",
+                (expires_at, f"__hash__{key}"),
+            )
             self._conn.execute("UPDATE lists SET expires_at = ? WHERE key = ?", (expires_at, key))
             self._conn.execute("UPDATE zsets SET expires_at = ? WHERE key = ?", (expires_at, key))
         return True
@@ -113,6 +149,7 @@ class SQLiteBackend:
     # ── List ops ───────────────────────────────────────────────────────
 
     def rpush(self, key: str, *values: str) -> int:
+        self._purge_expired_collections(key)
         with self._lock:
             with self._conn:
                 max_pos = self._conn.execute(
@@ -128,6 +165,7 @@ class SQLiteBackend:
             ).fetchone()[0]
 
     def lpush(self, key: str, *values: str) -> int:
+        self._purge_expired_collections(key)
         with self._lock:
             with self._conn:
                 min_pos = self._conn.execute(
@@ -143,12 +181,14 @@ class SQLiteBackend:
             ).fetchone()[0]
 
     def llen(self, key: str) -> int:
+        self._purge_expired_collections(key)
         with self._lock:
             return self._conn.execute(
                 "SELECT COUNT(*) FROM lists WHERE key = ?", (key,)
             ).fetchone()[0]
 
     def lrange(self, key: str, start: int, end: int) -> list[str]:
+        self._purge_expired_collections(key)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT value FROM lists WHERE key = ? ORDER BY position", (key,)
@@ -159,6 +199,7 @@ class SQLiteBackend:
         return values[start : end + 1]
 
     def ltrim(self, key: str, start: int, end: int) -> None:
+        self._purge_expired_collections(key)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id FROM lists WHERE key = ? ORDER BY position", (key,)
@@ -178,6 +219,7 @@ class SQLiteBackend:
     def eval(self, script: str, numkeys: int, *keys_and_args: str) -> list:
         """Handles SignalBuffer's atomic LRANGE + DEL flush."""
         key = keys_and_args[0]
+        self._purge_expired_collections(key)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT value FROM lists WHERE key = ? ORDER BY position", (key,)
@@ -193,6 +235,7 @@ class SQLiteBackend:
     # ── Sorted set ops ─────────────────────────────────────────────────
 
     def zadd(self, key: str, mapping: dict) -> int:
+        self._purge_expired_collections(key)
         with self._lock, self._conn:
             for member, score in mapping.items():
                 self._conn.execute(
@@ -202,6 +245,7 @@ class SQLiteBackend:
         return len(mapping)
 
     def zrevrange(self, key: str, start: int, end: int) -> list[str]:
+        self._purge_expired_collections(key)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT member FROM zsets WHERE key = ? ORDER BY score DESC", (key,)
@@ -212,6 +256,7 @@ class SQLiteBackend:
         return members[start : end + 1]
 
     def zrange(self, key: str, start: int, end: int) -> list[str]:
+        self._purge_expired_collections(key)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT member FROM zsets WHERE key = ? ORDER BY score ASC", (key,)
@@ -222,6 +267,7 @@ class SQLiteBackend:
         return members[start : end + 1]
 
     def zremrangebyrank(self, key: str, start: int, end: int) -> int:
+        self._purge_expired_collections(key)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT member FROM zsets WHERE key = ? ORDER BY score ASC", (key,)
@@ -241,6 +287,7 @@ class SQLiteBackend:
         return len(to_delete)
 
     def zcard(self, key: str) -> int:
+        self._purge_expired_collections(key)
         with self._lock:
             return self._conn.execute(
                 "SELECT COUNT(*) FROM zsets WHERE key = ?", (key,)
@@ -251,42 +298,51 @@ class SQLiteBackend:
     def hset(self, key: str, field: str, value: str) -> None:
         import json as _json
         hkey = f"__hash__{key}"
-        with self._lock:
-            raw = self._conn.execute("SELECT value FROM kv WHERE key = ?", (hkey,)).fetchone()
+        now = time.time()
+        with self._lock, self._conn:
+            raw = self._conn.execute(
+                "SELECT value, expires_at FROM kv WHERE key = ?", (hkey,)
+            ).fetchone()
+            if raw and raw[1] is not None and raw[1] <= now:
+                self._conn.execute("DELETE FROM kv WHERE key = ?", (hkey,))
+                raw = None
             data = _json.loads(raw[0]) if raw else {}
             data[field] = value
-            with self._conn:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO kv (key, value, expires_at) VALUES (?, ?, NULL)",
-                    (hkey, _json.dumps(data)),
-                )
+            expires_at = raw[1] if raw else None
+            self._conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value, expires_at) VALUES (?, ?, ?)",
+                (hkey, _json.dumps(data), expires_at),
+            )
 
     def hgetall(self, key: str) -> dict:
         import json as _json
-        with self._lock:
-            raw = self._conn.execute(
-                "SELECT value FROM kv WHERE key = ?", (f"__hash__{key}",)
-            ).fetchone()
-        if not raw:
+        raw_value = self.get(f"__hash__{key}")
+        if raw_value is None:
             return {}
         try:
-            return _json.loads(raw[0])
+            return _json.loads(raw_value)
         except Exception:
             return {}
 
     def hincrby(self, key: str, field: str, amount: int) -> int:
         import json as _json
         hkey = f"__hash__{key}"
-        with self._lock:
-            raw = self._conn.execute("SELECT value FROM kv WHERE key = ?", (hkey,)).fetchone()
+        now = time.time()
+        with self._lock, self._conn:
+            raw = self._conn.execute(
+                "SELECT value, expires_at FROM kv WHERE key = ?", (hkey,)
+            ).fetchone()
+            if raw and raw[1] is not None and raw[1] <= now:
+                self._conn.execute("DELETE FROM kv WHERE key = ?", (hkey,))
+                raw = None
             data = _json.loads(raw[0]) if raw else {}
             new_val = int(data.get(field, 0)) + amount
             data[field] = str(new_val)
-            with self._conn:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO kv (key, value, expires_at) VALUES (?, ?, NULL)",
-                    (hkey, _json.dumps(data)),
-                )
+            expires_at = raw[1] if raw else None
+            self._conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value, expires_at) VALUES (?, ?, ?)",
+                (hkey, _json.dumps(data), expires_at),
+            )
         return new_val
 
     # ── Scan (used by ProjectStore scan, team scan) ─────────────────────
@@ -332,6 +388,18 @@ class _Pipeline:
 
     def setex(self, key: str, ttl: int, value: str) -> "_Pipeline":
         self._ops.append(("setex", key, ttl, value))
+        return self
+
+    def delete(self, *keys: str) -> "_Pipeline":
+        self._ops.append(("delete", *keys))
+        return self
+
+    def hset(self, key: str, field: str, value: str) -> "_Pipeline":
+        self._ops.append(("hset", key, field, value))
+        return self
+
+    def incr(self, key: str) -> "_Pipeline":
+        self._ops.append(("incr", key))
         return self
 
     def execute(self) -> list:
