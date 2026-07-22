@@ -1,23 +1,25 @@
 """
-hosted_client — stdio-mode relay to the hosted Agent Magnet server
---------------------------------------------------------------------
+hosted_client — HostedRelayTeamBackend, the public thin-client implementation
+--------------------------------------------------------------------------------
 Local/stdio processes never hold Postgres credentials (see
 team_permissions.py's module docstring — that module is deliberately
 Postgres-only and unusable outside our hosted deployment). This module is
 the ONLY way a stdio process can perform team operations: over HTTPS,
 authenticated by the user's own MAGNET_API_KEY, against the hosted server's
-Postgres-backed team registry (magnet.team_permissions, reached via the
-new /api/team/check and /api/team/op endpoints in http_server.py).
+/api/team/op endpoint (http_server.py), which re-validates the key and
+re-checks the plan/membership server-side on every single call.
 
-FAIL CLOSED, always: any network error, timeout, non-2xx-with-unparsable-
-body, or malformed response returns None (or (False, msg) where noted) —
-never an implicit "allowed". A local process being unable to reach the
-hosted server must never be treated as "team memory is available locally
-instead" — there is no local fallback for permission, by design (see
-mcp_server._is_hosted_mode / the stdio branches of _handle_create_team
-etc.). MAGNET_REDIS_URL, if set, only ever affects where TEAM DATA is
-stored once permission has already been granted here — it has zero
-bearing on any decision made in this file.
+HostedRelayTeamBackend implements the TeamBackend protocol (team_backend.py)
+by doing exactly one thing per method: POST an op, return whatever JSON body
+came back. No plan/role/membership branching happens here — that would
+defeat the point. FAIL CLOSED, always: any network error, timeout, or
+unparsable response is treated as a denial, via the same {"error","message"}
+shape a real server denial would use — never an implicit "allowed", and
+never a crash into the calling tool handler.
+
+MAGNET_REDIS_URL, if set, only ever affects WHERE team data is stored once
+permission has already been granted server-side — it has zero bearing on
+any decision made in this file.
 
 Uses stdlib urllib only — no new dependency, since this must work in the
 plain `pip install agent-magnet` (no [postgres] extra) case that's the
@@ -36,6 +38,15 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_HOSTED_URL = "https://mcp.agentmagnet.app"
 _TIMEOUT = 8.0
+
+_UNREACHABLE = {
+    "error": "unreachable",
+    "message": "Could not reach the hosted server. Try again shortly.",
+}
+_NO_KEY = {
+    "error": "no_key",
+    "message": "Team memory requires an Agent Magnet key. Set MAGNET_API_KEY. Get one at agentmagnet.app.",
+}
 
 
 def _hosted_base_url() -> str:
@@ -68,41 +79,79 @@ def _post(path: str, payload: dict) -> dict | None:
         return None
 
 
-def check_team_key(api_key: str) -> dict | None:
-    """
-    {"allowed": bool, "plan": str|None, "user_id": str} on any response the
-    hosted server actually gave us, or None if it couldn't be reached at
-    all. Callers MUST treat None as denied, not as "skip the check" — see
-    module docstring.
-    """
-    if not api_key:
+class HostedRelayTeamBackend:
+    """The default TeamBackend for every stdio/local process. Reads
+    MAGNET_API_KEY once at construction — matching stdio's "one user per
+    process" model (mcp_server.py's module docstring) — and sends it with
+    every op. If no key is configured, every method fails closed without
+    making a network call at all."""
+
+    def __init__(self, api_key: str | None = None) -> None:
+        self._api_key = (api_key if api_key is not None else os.environ.get("MAGNET_API_KEY", "")).strip()
+
+    def _op(self, op: str, **fields: object) -> dict:
+        if not self._api_key:
+            return dict(_NO_KEY)
+        result = _post("/api/team/op", {"key": self._api_key, "op": op, **fields})
+        if result is None:
+            return dict(_UNREACHABLE)
+        return result
+
+    # ── Team coordination ───────────────────────────────────────────────
+
+    def create_team(self, user_id: str, team_name: str) -> dict:  # noqa: ARG002 — identity comes from the key server-side
+        return self._op("create_team", name=team_name)
+
+    def join_team(self, user_id: str, team_id: str) -> dict:  # noqa: ARG002
+        return self._op("join_team", team_id=team_id)
+
+    def add_member(self, actor_user_id: str, team_id: str, new_user_id: str) -> dict:  # noqa: ARG002
+        return self._op("add_member", team_id=team_id, new_user_id=new_user_id)
+
+    def list_members(self, user_id: str, team_id: str) -> dict:  # noqa: ARG002
+        return self._op("list_team_members", team_id=team_id)
+
+    # ── Shared project data ──────────────────────────────────────────────
+
+    def load_team_items(self, user_id: str, team_id: str, project: str) -> list[dict]:  # noqa: ARG002
+        result = self._op("load_team_items", team_id=team_id, project=project)
+        items = result.get("items")
+        return items if isinstance(items, list) else []
+
+    def list_shared_projects(self, user_id: str, team_id: str) -> dict:  # noqa: ARG002
+        return self._op("list_team_projects", team_id=team_id)
+
+    def share_project(self, user_id: str, team_id: str, project: str, items: list[dict]) -> dict:  # noqa: ARG002
+        return self._op("share_project_to_team", team_id=team_id, project=project, items=items)
+
+    def share_item(self, user_id: str, team_id: str, project: str, item_id: str, item: dict) -> dict:  # noqa: ARG002
+        return self._op("share_item_to_team", team_id=team_id, project=project, item_id=item_id, item=item)
+
+    def get_team_memory(self, user_id: str, team_id: str, project: str, explicit_project: bool) -> dict:  # noqa: ARG002
+        return self._op(
+            "get_team_memory", team_id=team_id, project=project, explicit_project=explicit_project
+        )
+
+    def get_history(self, user_id: str, team_id: str, item_id: str | None) -> dict:  # noqa: ARG002
+        return self._op("history", team_id=team_id, item_id=item_id)
+
+    def get_team_status(self, user_id: str, team_id: str, project: str) -> dict:  # noqa: ARG002
+        return self._op("get_team_status", team_id=team_id, project=project)
+
+    # ── Fire-and-forget checks ──────────────────────────────────────────
+
+    def check_auto_promote(self, user_id: str, team_id: str, project: str, item: dict) -> bool:  # noqa: ARG002
+        result = self._op("check_auto_promote", team_id=team_id, project=project, item=item)
+        return bool(result.get("promoted"))
+
+    def check_memory_cap(self, user_id: str) -> str | None:  # noqa: ARG002
+        # Personal storage cost is the user's own disk in stdio/local mode —
+        # never capped, and never worth a network round trip on every write.
+        # Only a registered DirectPostgresTeamBackend (hosted process)
+        # enforces a real cap; see mcp_server._memory_cap_check.
         return None
-    return _post("/api/team/check", {"key": api_key})
 
-
-def remote_create_team(api_key: str, name: str) -> dict | None:
-    """Team dict on success, None on any denial or failure. The hosted
-    endpoint re-validates the key AND re-checks the plan server-side —
-    this is not just a permission pre-check, it performs the actual
-    creation, since team_permissions.py's registry only exists there."""
-    result = _post("/api/team/op", {"key": api_key, "op": "create_team", "name": name})
-    if not result or "team" not in result:
+    def record_memory_delta(self, user_id: str, delta: int) -> None:  # noqa: ARG002
+        # No-op for the same reason as check_memory_cap above — nothing to
+        # meter locally.
         return None
-    return result["team"]
-
-
-def remote_join_team(api_key: str, team_id: str) -> dict | None:
-    result = _post("/api/team/op", {"key": api_key, "op": "join_team", "team_id": team_id})
-    if not result or "team" not in result:
-        return None
-    return result["team"]
-
-
-def remote_add_member(api_key: str, team_id: str, new_user_id: str) -> tuple[bool, str]:
-    result = _post(
-        "/api/team/op",
-        {"key": api_key, "op": "add_member", "team_id": team_id, "new_user_id": new_user_id},
-    )
-    if not result:
-        return False, "Could not reach the hosted server to add this member. Try again shortly."
-    return bool(result.get("ok")), result.get("message", "")

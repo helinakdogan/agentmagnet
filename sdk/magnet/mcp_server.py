@@ -49,6 +49,8 @@ import mcp.types as types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
+from magnet.team_backend import get_team_backend as _get_team_backend
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_USER_ID = os.environ.get("MAGNET_USER_ID", "user")
@@ -228,10 +230,11 @@ def _write_rhythm(profile: str, project: str, **updates: Any) -> None:
 
 async def _extract_from_messages(
     messages: list[dict], user: str, profile: str, project: str
-) -> tuple[int, bool]:
+) -> tuple[int, str | None]:
     """Extract project-relevant insights from a message window and save to
-    MemoryStore. Returns (saved_count, cap_hit) — cap_hit is always False
-    outside hosted mode.
+    MemoryStore. Returns (saved_count, cap_message) — cap_message is the
+    registered TeamBackend's own deny text, or None if nothing was capped
+    (always None for the default local/stdio backend, which is unlimited).
 
     Whether a message is worth saving is decided entirely by the extractor
     (detect_category returning a real category vs None) plus MemoryStore's
@@ -247,7 +250,7 @@ async def _extract_from_messages(
     source_tool = _current_source_tool()
     source_transport = _current_source_transport()
     saved = 0
-    cap_hit = False
+    cap_message: str | None = None
     for msg in messages:
         if msg.get("role") != "user":
             continue
@@ -259,8 +262,8 @@ async def _extract_from_messages(
         if category is None:
             continue
         text = compress_essence(text)
-        if await _memory_cap_check(user):
-            cap_hit = True
+        cap_message = await _memory_cap_check(user)
+        if cap_message:
             break
         added = await asyncio.to_thread(
             store.add_entry, user, profile, project, category, text,
@@ -269,29 +272,46 @@ async def _extract_from_messages(
         if added:
             saved += 1
             await _record_memory_delta(user, 1)
-    return saved, cap_hit
+    return saved, cap_message
 
 
 # ── Singleton backends ────────────────────────────────────────────────────────
 
 _backend: Any = None
+_external_backend: Any = None
 _memory: Any = None
 _memory_store: Any = None
 _compressor: Any = None
-_team_store: Any = None
+
+
+def set_storage_backend(client: Any) -> None:
+    """Called only by the hosted server at startup, before serving any
+    request — registers a pre-built backend (a PostgresBackend instance) as
+    the shared storage client, bypassing the Redis/SQLite resolution below
+    entirely. The public package never calls this itself; it has no way to
+    construct a PostgresBackend (postgres_store.py is private-repo-only), so
+    the Redis→SQLite path below is the only one it can ever take."""
+    global _external_backend
+    _external_backend = client
 
 
 def _get_backend() -> Any:
-    """Shared Redis, Postgres, or SQLite backend — initialized once.
+    """Shared Redis or SQLite backend — initialized once.
 
-    Resolution order: Redis (MAGNET_REDIS_URL) > Postgres (MAGNET_DATABASE_URL,
-    hosted HTTP mode) > SQLite (default, stdio/free tier — unchanged)."""
+    Resolution order: an externally-registered backend (hosted server only,
+    see set_storage_backend) > Redis (MAGNET_REDIS_URL) > SQLite (default,
+    stdio/free tier — unchanged). This module never imports a Postgres
+    backend itself — postgres_store.py is private-repo-only; the hosted
+    server registers its own PostgresBackend instance instead."""
     global _backend
     if _backend is not None:
         return _backend
 
+    if _external_backend is not None:
+        _backend = _external_backend
+        return _backend
+
     redis_url = os.environ.get("MAGNET_REDIS_URL")
-    database_url = os.environ.get("MAGNET_DATABASE_URL")
     client: Any = None
     if redis_url:
         try:
@@ -301,14 +321,6 @@ def _get_backend() -> Any:
             logger.info("[magnet] Redis connected")
         except Exception as e:
             logger.warning(f"[magnet] Redis unavailable ({e}); falling back to SQLite")
-
-    if client is None and database_url:
-        try:
-            from magnet.postgres_store import PostgresBackend
-            client = PostgresBackend(database_url)
-            logger.info("[magnet] Postgres connected (hosted mode)")
-        except Exception as e:
-            logger.warning(f"[magnet] Postgres unavailable ({e}); falling back to SQLite")
 
     if client is None:
         from magnet.local_store import SQLiteBackend
@@ -365,49 +377,21 @@ def _get_compressor() -> Any:
     return _compressor
 
 
-def _get_team_store() -> Any:
-    """MagnetTeamStore — category-based team memory, "managed" storage_mode.
-    Requires Redis/Postgres-backed shared backend."""
-    global _team_store
-    if _team_store is None:
-        from magnet.team_store import MagnetTeamStore
-        _team_store = MagnetTeamStore(redis_client=_get_backend())
-    return _team_store
-
-
-def _team_store_for(team: dict) -> Any:
-    """Pick the right MagnetTeamStore backend for a team's storage_mode.
-    'managed' reuses the shared process-wide backend singleton (same one
-    personal memory uses); 'byo' opens a connection to the team's own
-    (already-decrypted) redis_url. `team` must be a dict already returned by
-    team_permissions.check_team_permission()/join_team()/create_team() — this
-    function never itself decides whether the caller is allowed to be here.
-    """
-    if team.get("storage_mode") == "byo" and team.get("redis_url"):
-        from magnet.team_store import MagnetTeamStore
-        import redis as redis_lib
-        return MagnetTeamStore(redis_client=redis_lib.from_url(team["redis_url"], decode_responses=True))
-    return _get_team_store()
-
-
 async def _load_team_items_if_shared(project: str, team_id: str) -> list[dict]:
     """Load team items for project if it's shared; returns [] if not shared,
-    permission denied, or no hosted Postgres reachable. Runs on every recall
+    permission denied, or the backend is unreachable. Runs on every recall
     when a team_id is active, so a denial here must never surface as an
-    error — only ever silently fall back to personal-only memory."""
+    error — only ever silently fall back to personal-only memory. Delegates
+    entirely to the registered TeamBackend — see team_backend.py."""
     if not team_id:
         return []
     try:
-        from magnet.team_permissions import check_team_permission
-        team = await asyncio.to_thread(check_team_permission, _current_user_id(), team_id, "recall")
-        if team is None:
-            return []
-        ts = _team_store_for(team)
-        if await asyncio.to_thread(ts.is_project_shared, team_id, project):
-            return await asyncio.to_thread(ts.load_team_items, team_id, project)
+        return await asyncio.to_thread(
+            _get_team_backend().load_team_items, _current_user_id(), team_id, project
+        )
     except Exception as e:
         logger.debug(f"[team] load_team_items failed: {e}")
-    return []
+        return []
 
 
 # ── Signal type → storage category ───────────────────────────────────────────
@@ -1050,42 +1034,6 @@ async def list_tools() -> list[types.Tool]:
             description="Show memory write and retrieval counts for this user.",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
-        # ── Team tools ────────────────────────────────────────────────────────
-        types.Tool(
-            name="get_team_profile",
-            description="Get the shared memory profile for a team.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "team_id": {"type": "string"},
-                    "project_id": {"type": "string"},
-                },
-                "required": ["team_id"],
-            },
-        ),
-        types.Tool(
-            name="add_team_signal",
-            description=(
-                "Write a signal to TEAM-SCOPED memory. Use only for team-wide conventions or watch-outs. "
-                "For personal preferences, use remember instead."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "team_id": {"type": "string"},
-                    "project_id": {"type": "string"},
-                    "messages": {
-                        "type": "array",
-                        "items": {"type": "object", "properties": {"role": {"type": "string"}, "content": {"type": "string"}}, "required": ["role", "content"]},
-                    },
-                    "signal_type": {
-                        "type": "string",
-                        "enum": ["correction", "rejection", "preference_like", "preference_dislike", "tone_preference", "watch_out"],
-                    },
-                },
-                "required": ["team_id", "messages", "signal_type"],
-            },
-        ),
         # ── Compression tools ─────────────────────────────────────────────────
         types.Tool(
             name="compress_context",
@@ -1128,7 +1076,7 @@ async def list_tools() -> list[types.Tool]:
 _TEAM_TOOL_NAMES = frozenset({
     "create_team", "join_team", "add_team_member", "list_team_members",
     "list_team_projects", "share_project_to_team", "share_item_to_team",
-    "get_team_memory", "get_team_profile", "add_team_signal",
+    "get_team_memory",
 })
 
 
@@ -1267,18 +1215,6 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
         elif name == "usage_stats":
             result = await _handle_usage_stats()
-        elif name == "get_team_profile":
-            result = await _handle_get_team_profile(
-                team_id=arguments["team_id"],
-                project_id=arguments.get("project_id", "default"),
-            )
-        elif name == "add_team_signal":
-            result = await _handle_add_team_signal(
-                team_id=arguments["team_id"],
-                project_id=arguments.get("project_id", "default"),
-                messages=arguments["messages"],
-                signal_type=arguments["signal_type"],
-            )
         elif name == "compress_context":
             result = await _handle_compress_context(
                 text=arguments["text"],
@@ -1385,18 +1321,25 @@ async def _handle_remember(
 
     auto_promoted = False
     if saved and _current_team_id():
-        # Check if this new item agrees with an existing team item → auto-promote
+        # Every other team-touching path re-verifies live paid membership
+        # before touching team data — auto-promote must too. Without this, a
+        # stale team_id (a removed member, or a key downgraded off a paid
+        # plan) could still trigger a team-memory write with no live check
+        # at all, since _current_team_id() alone is not proof of current
+        # membership/plan. check_auto_promote() (the registered TeamBackend)
+        # verifies this itself and returns False on ANY denial — a denial
+        # here silently skips promotion, it must never fail the remember
+        # call itself, so this stays inside a broad try/except.
         try:
-            ts = _get_team_store()
-            if await asyncio.to_thread(ts.is_project_shared, _current_team_id(), project):
-                items = await asyncio.to_thread(store.load, user, profile, project)
-                new_item = items[-1] if items else None
-                if new_item:
-                    auto_promoted = await asyncio.to_thread(
-                        ts.auto_promote_if_agreed, _current_team_id(), project, new_item, user
-                    )
-                    if auto_promoted:
-                        usage.record_team_write(_current_team_id(), project)
+            items = await asyncio.to_thread(store.load, user, profile, project)
+            new_item = items[-1] if items else None
+            if new_item:
+                auto_promoted = await asyncio.to_thread(
+                    _get_team_backend().check_auto_promote,
+                    user, _current_team_id(), project, new_item,
+                )
+                if auto_promoted:
+                    usage.record_team_write(_current_team_id(), project)
         except Exception as e:
             logger.debug(f"[team] auto-promote check failed: {e}")
 
@@ -1494,137 +1437,44 @@ async def _handle_mark_done(
 
 # ── Team handlers ─────────────────────────────────────────────────────────────
 #
-# Every handler below calls into team_permissions.py FIRST — the Postgres-
-# only, server-side module that owns team coordination/permission. None of
-# these handlers can succeed without a hosted key reaching our Postgres;
-# that's true in both stdio and HTTP transports, since this dispatch code is
-# shared between them. See team_permissions.py's module docstring.
-
-def _is_hosted_mode() -> bool:
-    """True only when running as agent-magnet-http, which holds direct
-    Postgres credentials. False in stdio — which must NEVER treat local
-    state (MAGNET_REDIS_URL, MAGNET_TEAM_ID, or anything else local) as
-    permission. stdio verifies team-plan access exclusively by calling the
-    hosted server over HTTPS — see hosted_client.py — using MAGNET_API_KEY.
-    MAGNET_REDIS_URL is completely irrelevant to this decision; it only
-    ever affects WHERE team data is stored once permission is granted."""
-    return bool(os.environ.get("MAGNET_DATABASE_URL"))
+# Every handler below calls _get_team_backend() ONLY — never team_permissions/
+# team_store/postgres_store/auth directly. Which backend is registered (the
+# default HostedRelayTeamBackend, which relays over HTTPS using MAGNET_API_KEY,
+# or a hosted server's own DirectPostgresTeamBackend, registered via
+# set_team_backend() at startup) is what decides whether this process reaches
+# our Postgres itself or over the network — this file never branches on that
+# itself. See team_backend.py.
 
 
 # ── Memory cap — Part 2 of the hard usage limits ────────────────────────────
 #
-# Caps stored memory items per user, keyed by plan. Hosted mode only — stdio/
-# local storage costs us nothing (it's the user's own disk), so there is
-# nothing to protect there and it is never capped, matching _is_hosted_mode's
-# use everywhere else in this file.
-#
-# Counted via a maintained counter (hincrby on a hash field), not a full
-# scan: MemoryStore's own storage is JSON blobs across many
-# vmm:{user}:{profile}:{project} keys with no cheap "total items for this
-# user across every profile/project" query, so a running counter incremented
-# on every successful add_entry / decremented on every successful
-# delete_entry is the only O(1) option. This trades perfect exactness (a
-# crash between add_entry succeeding and the counter update would drift by
-# one) for being safe to call on every single write — an acceptable
-# tradeoff for a protective cap, not a billing ledger.
-
-_MEMORY_CAP_MSG = "Memory limit reached for your plan. Upgrade or remove items at agentmagnet.app."
-
-
-def _memory_cap_for_plan(plan: str | None) -> int:
-    from magnet.team_permissions import PAID_PLANS
-    if plan in PAID_PLANS:
-        return int(os.environ.get("MAGNET_PAID_MEMORY_CAP", "50000"))
-    return int(os.environ.get("MAGNET_FREE_MEMORY_CAP", "1000"))
-
-
-def _memory_count_key(user: str) -> str:
-    return f"magnet:memcount:{user.strip().lower()}"
-
+# Caps stored memory items per user, keyed by plan. Delegated entirely to the
+# registered TeamBackend (see team_backend.py): the default HostedRelayTeamBackend
+# never enforces this (stdio/local storage costs us nothing — it's the user's
+# own disk), so it's always unlimited there. Only a hosted server's own
+# DirectPostgresTeamBackend enforces a real cap.
 
 async def _memory_cap_check(user: str) -> str | None:
     """Returns None if the write is allowed, or the deny message if `user`
-    is already at/over their plan's memory cap. No-op (always None) outside
-    hosted mode."""
-    if not _is_hosted_mode():
-        return None
-    from magnet.team_permissions import get_active_plan
-    plan = await asyncio.to_thread(get_active_plan, user)
-    cap = _memory_cap_for_plan(plan)
-    backend = _get_backend()
-    # hincrby(..., 0) reads the current value without changing it — cheap,
-    # O(1), same call used to increment; no separate "hget" needed.
-    current = await asyncio.to_thread(backend.hincrby, _memory_count_key(user), "total", 0)
-    if current >= cap:
-        return _MEMORY_CAP_MSG
-    return None
+    is already at/over their plan's memory cap."""
+    return await asyncio.to_thread(_get_team_backend().check_memory_cap, user)
 
 
 async def _record_memory_delta(user: str, delta: int) -> None:
-    """Adjusts the maintained per-user item counter. No-op outside hosted
-    mode. Best-effort — a counter update failure must never break the write
-    it's accounting for."""
-    if not _is_hosted_mode():
-        return
+    """Adjusts the maintained per-user item counter. Best-effort — a counter
+    update failure must never break the write it's accounting for."""
     try:
-        backend = _get_backend()
-        await asyncio.to_thread(backend.hincrby, _memory_count_key(user), "total", delta)
+        await asyncio.to_thread(_get_team_backend().record_memory_delta, user, delta)
     except Exception as e:
         logger.debug(f"[memory_cap] counter update failed: {e}")
 
 
-_STDIO_NO_KEY_MSG = "Team memory requires a paid Agent Magnet key. Get one at agentmagnet.app."
-_STDIO_UNREACHABLE_MSG = "Could not verify your plan with the hosted server. Try again shortly."
-
-
-async def _stdio_team_permission_check() -> tuple[str, None] | tuple[None, str]:
-    """
-    stdio-mode gate: returns (api_key, None) if a hosted, paid-plan key is
-    confirmed by the hosted server, or (None, deny_message) otherwise.
-
-    Every branch here fails closed:
-      - no MAGNET_API_KEY at all         -> deny, no network call made
-      - hosted server unreachable/error  -> deny (never treated as "allow")
-      - key invalid/inactive/free plan   -> deny with the hosted server's message
-    There is no code path in here that can return "allowed" without a
-    successful, plan-confirming round trip to the hosted server.
-    """
-    api_key = os.environ.get("MAGNET_API_KEY", "").strip()
-    if not api_key:
-        return None, _STDIO_NO_KEY_MSG
-
-    from magnet.hosted_client import check_team_key
-
-    check = await asyncio.to_thread(check_team_key, api_key)
-    if check is None:
-        return None, _STDIO_UNREACHABLE_MSG
-    if not check.get("allowed"):
-        from magnet.team_permissions import PLAN_REQUIRED_MSG
-        return None, check.get("message") or PLAN_REQUIRED_MSG
-    return api_key, None
-
-
 async def _handle_create_team(team_name: str) -> str:
     user = _current_user_id()
-
-    if _is_hosted_mode():
-        from magnet.team_permissions import (
-            create_team, has_paid_plan, team_permission_denied_message, TEAM_KEY_REQUIRED_MSG,
-        )
-        if not await asyncio.to_thread(has_paid_plan, user):
-            return await asyncio.to_thread(team_permission_denied_message, user)
-        team = await asyncio.to_thread(create_team, user, team_name)
-        if team is None:
-            return TEAM_KEY_REQUIRED_MSG
-    else:
-        api_key, deny_msg = await _stdio_team_permission_check()
-        if deny_msg:
-            return deny_msg
-        from magnet.hosted_client import remote_create_team
-        team = await asyncio.to_thread(remote_create_team, api_key, team_name)
-        if team is None:
-            return "Could not create the team on the hosted server. Try again shortly."
-
+    result = await asyncio.to_thread(_get_team_backend().create_team, user, team_name)
+    if "error" in result:
+        return result["message"]
+    team = result["team"]
     team_id = team["id"]
     _get_usage_counter().record_team_write(team_id)
     return (
@@ -1638,25 +1488,10 @@ async def _handle_create_team(team_name: str) -> str:
 
 async def _handle_join_team(team_id: str) -> str:
     user = _current_user_id()
-
-    if _is_hosted_mode():
-        from magnet.team_permissions import (
-            join_team, has_paid_plan, team_permission_denied_message, TEAM_KEY_REQUIRED_MSG,
-        )
-        if not await asyncio.to_thread(has_paid_plan, user):
-            return await asyncio.to_thread(team_permission_denied_message, user)
-        team = await asyncio.to_thread(join_team, user, team_id)
-        if team is None:
-            return TEAM_KEY_REQUIRED_MSG
-    else:
-        api_key, deny_msg = await _stdio_team_permission_check()
-        if deny_msg:
-            return deny_msg
-        from magnet.hosted_client import remote_join_team
-        team = await asyncio.to_thread(remote_join_team, api_key, team_id)
-        if team is None:
-            return "Could not join the team on the hosted server (it may not exist). Try again shortly."
-
+    result = await asyncio.to_thread(_get_team_backend().join_team, user, team_id)
+    if "error" in result:
+        return result["message"]
+    team = result["team"]
     _get_usage_counter().record_team_write(team_id)
     return (
         f"Joined team '{team['name']}' ({team_id}).\n\n"
@@ -1667,40 +1502,22 @@ async def _handle_join_team(team_id: str) -> str:
 
 async def _handle_add_team_member(team_id: str, user_id: str) -> str:
     actor = _current_user_id()
-
-    if _is_hosted_mode():
-        from magnet.team_permissions import add_member, has_paid_plan, team_permission_denied_message
-        if not await asyncio.to_thread(has_paid_plan, actor):
-            return await asyncio.to_thread(team_permission_denied_message, actor)
-        try:
-            ok, msg = await asyncio.to_thread(add_member, actor, team_id, user_id)
-        except Exception as e:
-            return f"Could not add member: {e}"
-    else:
-        api_key, deny_msg = await _stdio_team_permission_check()
-        if deny_msg:
-            return deny_msg
-        from magnet.hosted_client import remote_add_member
-        ok, msg = await asyncio.to_thread(remote_add_member, api_key, team_id, user_id)
-
-    if not ok:
-        return msg
+    result = await asyncio.to_thread(_get_team_backend().add_member, actor, team_id, user_id)
+    if not result.get("ok"):
+        return result.get("message", "Could not add member.")
     _get_usage_counter().record_team_write(team_id)
-    return f"{msg} They still need to add MAGNET_TEAM_ID={team_id} to their MCP config."
+    return f"{result['message']} They still need to add MAGNET_TEAM_ID={team_id} to their MCP config."
 
 
 async def _handle_list_team_members(team_id: str | None = None) -> str:
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
-    from magnet.team_permissions import check_team_permission, list_members, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
-    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "list_team_members")
-    if team is None:
-        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
-    try:
-        members = await asyncio.to_thread(list_members, tid)
-    except Exception as e:
-        return f"Could not list members: {e}"
+    result = await asyncio.to_thread(_get_team_backend().list_members, _current_user_id(), tid)
+    if "error" in result:
+        return result["message"]
+    team = result["team"]
+    members = result["members"]
     lines = [f"Team: {team.get('name', tid)} ({tid})", ""]
     for m in members:
         role_tag = " (owner)" if m["role"] == "owner" else ""
@@ -1724,15 +1541,10 @@ async def _handle_list_team_projects(team_id: str | None = None) -> str:
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one, or set MAGNET_TEAM_ID."
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
-    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "list_team_projects")
-    if team is None:
-        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
-    ts = _team_store_for(team)
-    try:
-        shared_projects = await asyncio.to_thread(ts.list_shared_projects, tid)
-    except Exception as e:
-        return f"Could not load team projects: {e}"
+    result = await asyncio.to_thread(_get_team_backend().list_shared_projects, _current_user_id(), tid)
+    if "error" in result:
+        return result["message"]
+    shared_projects = result["shared_projects"]
     if not shared_projects:
         return f"No projects shared yet in team {tid}. Use *team share to share the active project."
     return _format_shared_projects_menu(tid, shared_projects)
@@ -1746,20 +1558,14 @@ async def _handle_share_project_to_team(
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
-    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "share_project_to_team")
-    if team is None:
-        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
     user, profile, project = _resolve_context(profile, project)
     store = _get_memory_store()
     items = await asyncio.to_thread(store.load, user, profile, project)
     if not items:
         return f"No memory in {profile} / {project} to share yet."
-    ts = _team_store_for(team)
-    try:
-        result = await asyncio.to_thread(ts.share_project, user, project, tid, items)
-    except Exception as e:
-        return f"Could not share project: {e}"
+    result = await asyncio.to_thread(_get_team_backend().share_project, user, tid, project, items)
+    if "error" in result:
+        return result["message"]
     _get_usage_counter().record_team_write(tid, project)
     return (
         f"Shared {result['shared']} item{'s' if result['shared'] != 1 else ''} "
@@ -1777,20 +1583,15 @@ async def _handle_share_item_to_team(
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
-    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "share_item_to_team")
-    if team is None:
-        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
     user, profile, project = _resolve_context(profile, project)
     store = _get_memory_store()
     items = await asyncio.to_thread(store.load, user, profile, project)
-    ts = _team_store_for(team)
-    try:
-        result = await asyncio.to_thread(ts.share_item, tid, project, item_id, user, items)
-    except Exception as e:
-        return f"Could not share item: {e}"
+    item = next((i for i in items if i.get("id") == item_id), None)
+    if item is None:
+        return f"No item with id '{item_id}' found in personal memory."
+    result = await asyncio.to_thread(_get_team_backend().share_item, user, tid, project, item_id, item)
     if "error" in result:
-        return result["error"]
+        return result["message"]
     if result.get("already_shared"):
         return f"Already shared: '{result['text']}'"
     _get_usage_counter().record_team_write(tid, project)
@@ -1804,41 +1605,25 @@ async def _handle_get_team_memory(
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. Use *team new <name> to create one first."
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
-    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "get_team_memory")
-    if team is None:
-        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
-
-    ts = _team_store_for(team)
     explicit_project = project is not None
     _, profile, resolved_project = _resolve_context(None, project)
 
-    if not explicit_project:
-        # Local active project may point somewhere the team never shared —
-        # don't silently return empty, find the right shared project instead.
-        try:
-            is_shared = await asyncio.to_thread(ts.is_project_shared, tid, resolved_project)
-        except Exception as e:
-            return f"Could not check shared projects: {e}"
-
-        if not is_shared:
-            try:
-                shared_projects = await asyncio.to_thread(ts.list_shared_projects, tid)
-            except Exception as e:
-                return f"Could not load team projects: {e}"
-
-            if len(shared_projects) == 1:
-                resolved_project = shared_projects[0]["project"]
-                _write_active_context(profile, resolved_project)
-            elif len(shared_projects) > 1:
-                return _format_shared_projects_menu(tid, shared_projects)
-            else:
-                return f"No projects shared yet in team {tid}. Use *team share to share the active project."
-
-    try:
-        return await asyncio.to_thread(ts.format_team_display, tid, resolved_project)
-    except Exception as e:
-        return f"Could not load team memory: {e}"
+    result = await asyncio.to_thread(
+        _get_team_backend().get_team_memory, _current_user_id(), tid, resolved_project, explicit_project
+    )
+    if "error" in result:
+        return result["message"]
+    if "display_text" in result:
+        auto_selected = result.get("auto_selected_project")
+        if auto_selected:
+            # Local active project pointed somewhere the team never shared —
+            # the backend found the one project that IS shared; switching the
+            # local active context to it is purely local state, done here.
+            _write_active_context(profile, auto_selected)
+        return result["display_text"]
+    if result.get("ambiguous"):
+        return _format_shared_projects_menu(tid, result["shared_projects"])
+    return f"No projects shared yet in team {tid}. Use *team share to share the active project."
 
 
 async def _handle_history(
@@ -1848,13 +1633,10 @@ async def _handle_history(
     tid = team_id or _current_team_id()
     if not tid:
         return "No team set. History is a team feature — use *team new <name> to create one first."
-    from magnet.team_permissions import check_team_permission, team_permission_denied_message
-    team = await asyncio.to_thread(check_team_permission, _current_user_id(), tid, "history")
-    if team is None:
-        return await asyncio.to_thread(team_permission_denied_message, _current_user_id())
-
-    from magnet.team_store import get_history
-    rows = await asyncio.to_thread(get_history, tid, item_id, 50)
+    result = await asyncio.to_thread(_get_team_backend().get_history, _current_user_id(), tid, item_id)
+    if "error" in result:
+        return result["message"]
+    rows = result["history"]
     if not rows:
         scope = f"item {item_id}" if item_id else f"team {tid}"
         return f"No history yet for {scope}."
@@ -2160,7 +1942,7 @@ async def _handle_checkpoint(
     project: str | None = None,
 ) -> str:
     user, profile, project = _resolve_context(profile, project)
-    saved, cap_hit = await _extract_from_messages(messages, user, profile, project)
+    saved, cap_message = await _extract_from_messages(messages, user, profile, project)
     _get_usage_counter().record_write(project)
     _write_rhythm(
         profile, project,
@@ -2170,7 +1952,7 @@ async def _handle_checkpoint(
         last_items_saved=saved,
     )
     ctx = _ctx_tag(profile, project)
-    cap_note = f" {_MEMORY_CAP_MSG}" if cap_hit else ""
+    cap_note = f" {cap_message}" if cap_message else ""
     if saved:
         return f"Checkpoint — {saved} item{'s' if saved != 1 else ''} saved.{cap_note} {ctx}"
     return f"Checkpoint — nothing new to save.{cap_note} {ctx}"
@@ -2182,7 +1964,7 @@ async def _handle_save_now(
     project: str | None = None,
 ) -> str:
     user, profile, project = _resolve_context(profile, project)
-    saved, cap_hit = await _extract_from_messages(messages, user, profile, project)
+    saved, cap_message = await _extract_from_messages(messages, user, profile, project)
     _get_usage_counter().record_write(project)
     _write_rhythm(
         profile, project,
@@ -2194,7 +1976,7 @@ async def _handle_save_now(
     ctx = _ctx_tag(profile, project)
     store = _get_memory_store()
     total = len(await asyncio.to_thread(store.load, user, profile, project))
-    cap_note = f" {_MEMORY_CAP_MSG}" if cap_hit else ""
+    cap_note = f" {cap_message}" if cap_message else ""
     return (
         f"Saved everything up to here for {ctx}. "
         f"{saved} new item{'s' if saved != 1 else ''} captured. "
@@ -2258,17 +2040,19 @@ async def _handle_get_status() -> str:
     team_line = "none (solo mode)"
     if _current_team_id():
         try:
-            from magnet.team_permissions import check_team_permission, list_members, team_permission_denied_message
-            team = await asyncio.to_thread(check_team_permission, user, _current_team_id(), "get_status")
-            if team is None:
-                deny_msg = await asyncio.to_thread(team_permission_denied_message, user)
-                team_line = f"{_current_team_id()} ({deny_msg})"
+            result = await asyncio.to_thread(
+                _get_team_backend().get_team_status, user, _current_team_id(), project
+            )
+            if "error" in result:
+                team_line = f"{_current_team_id()} ({result['message']})"
             else:
-                ts = _team_store_for(team)
-                members = await asyncio.to_thread(list_members, _current_team_id())
-                shared = await asyncio.to_thread(ts.is_project_shared, _current_team_id(), project)
-                shared_tag = " · project shared ✓" if shared else " · project not yet shared"
-                team_line = f"{team['name']} ({len(members)} member{'s' if len(members) != 1 else ''}) · {team['plan']}{shared_tag}"
+                shared_tag = " · project shared ✓" if result.get("project_shared") else " · project not yet shared"
+                member_count = result.get("member_count", 0)
+                team_line = (
+                    f"{result.get('name', _current_team_id())} "
+                    f"({member_count} member{'s' if member_count != 1 else ''}) · "
+                    f"{result.get('plan')}{shared_tag}"
+                )
         except Exception as e:
             team_line = f"{_current_team_id()} (error checking team status: {e})"
 
@@ -2360,75 +2144,6 @@ async def _handle_usage_stats() -> dict:
         "stats": stats,
         "note": "Metering active. Local mode is unlimited.",
     }
-
-
-# ── Team handlers ─────────────────────────────────────────────────────────────
-
-async def _handle_get_team_profile(team_id: str, project_id: str) -> dict:
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
-    team = await asyncio.to_thread(check_team_permission, _current_user_id(), team_id, "get_team_profile")
-    if team is None:
-        return {"error": await asyncio.to_thread(team_permission_denied_message, _current_user_id())}
-    # NOTE: this legacy preference-profile subsystem (TeamStore/memory._team_store,
-    # distinct from MagnetTeamStore above) always uses the shared managed
-    # backend — storage_mode/BYO selection is not wired into it. Permission
-    # is enforced the same way as everywhere else; data location is not.
-    from magnet.team_store import TeamMemoryRequiresRedis
-    memory = _get_memory()
-    try:
-        profile = await asyncio.to_thread(
-            memory._team_store.load_team_profile, team_id, project_id
-        )
-    except TeamMemoryRequiresRedis as e:
-        return {"error": str(e)}
-    if not profile:
-        return {"team_id": team_id, "project_id": project_id, "prefers": [], "watch_out": []}
-    buckets: dict[str, list] = {"prefers": [], "dislikes": [], "expects": [], "watch_out": []}
-    for pref in profile.get("preferences", []):
-        if not isinstance(pref, dict):
-            continue
-        rel = pref.get("relation", "")
-        if rel in buckets:
-            buckets[rel].append({
-                "text": pref.get("natural_text", pref.get("subject", "")),
-                "confidence": round(pref.get("confidence", 0.5), 3),
-            })
-    return {"team_id": team_id, "project_id": project_id, **buckets}
-
-
-async def _handle_add_team_signal(
-    team_id: str, project_id: str, messages: list[dict], signal_type: str
-) -> dict:
-    from magnet.team_permissions import check_team_permission, TEAM_KEY_REQUIRED_MSG, team_permission_denied_message
-    team = await asyncio.to_thread(check_team_permission, _current_user_id(), team_id, "add_team_signal")
-    if team is None:
-        return {"error": await asyncio.to_thread(team_permission_denied_message, _current_user_id())}
-    from magnet.team_store import TeamMemoryRequiresRedis
-    memory = _get_memory()
-    try:
-        memory._team_store._require_redis()
-    except TeamMemoryRequiresRedis as e:
-        return {"error": str(e)}
-
-    user_msgs = [m for m in messages if m.get("role") == "user"]
-    if not user_msgs:
-        return {"status": "ok", "signal_type": signal_type, "saved": False}
-
-    last_msg = user_msgs[-1].get("content", "")
-    tenant_id = f"{project_id}:{team_id}"
-
-    instant_types = {"preference_like", "preference_dislike", "tone_preference", "watch_out"}
-    if signal_type in instant_types:
-        existing = await asyncio.to_thread(memory._team_store.load_team_profile, team_id, project_id) or {}
-        updated = await asyncio.to_thread(
-            memory._reflector.instant_learn, tenant_id, signal_type, last_msg[:200], 0.75, existing
-        )
-        await asyncio.to_thread(memory._team_store.save_team_profile, team_id, project_id, updated)
-        return {"status": "ok", "signal_type": signal_type, "team_id": team_id, "instant_learned": True}
-
-    signal = {"type": signal_type, "message": last_msg[:200], "confidence": 0.6}
-    count = await asyncio.to_thread(memory._buffer.push, tenant_id, [signal])
-    return {"status": "ok", "signal_type": signal_type, "team_id": team_id, "buffer_count": count}
 
 
 # ── Compression handlers ──────────────────────────────────────────────────────

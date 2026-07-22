@@ -112,6 +112,22 @@ class UsageCounter:
 # These are module-level, not UsageCounter methods, because they're keyed by
 # (user_id, team_id) resolved fresh per HTTP request from the validated API
 # key — not bound to a single cached instance the way UsageCounter used to be.
+#
+# postgres_store.py is private-repo-only (it moves out with team_permissions.py/
+# auth.py/http_server.py — see the repo-split plan); a plain `pip install
+# agent-magnet` never has it on disk at all. _pool_if_configured() below is
+# the one place that boundary is crossed: it treats "module not installed"
+# exactly like "not configured" (both are legitimate "hosted mode isn't this
+# process" signals), so every function here stays a no-op in the public
+# package instead of raising ModuleNotFoundError.
+
+
+def _pool_if_configured() -> Any:
+    try:
+        from magnet.postgres_store import get_pool_if_configured
+    except ImportError:
+        return None
+    return get_pool_if_configured()
 
 
 def check_usage_limit(user_id: str, team_id: str = "") -> bool:  # noqa: ARG001
@@ -136,9 +152,7 @@ def record_usage_event(user_id: str, team_id: str, event_type: str, key_id: str 
     (logged at debug level only). key_id (the mg_sk_... key that made this
     call, if any) is optional and used only for per-key usage breakdowns —
     never for identity/authorization."""
-    from magnet.postgres_store import get_pool_if_configured
-
-    pool = get_pool_if_configured()
+    pool = _pool_if_configured()
     if pool is None:
         return
     try:
@@ -157,9 +171,7 @@ def get_hosted_usage_summary(user_id: str, team_id: str = "") -> dict | None:  #
     not running in hosted/Postgres mode. Feeds get_status's HTTP response
     (plan, memories stored, reads/writes this period).
     """
-    from magnet.postgres_store import get_pool_if_configured
-
-    pool = get_pool_if_configured()
+    pool = _pool_if_configured()
     if pool is None:
         return None
     try:
@@ -185,9 +197,7 @@ def get_usage_by_key(user_id: str) -> dict[str, int]:
     Rows recorded before key_id existed, or from dashboard actions that
     aren't tied to a specific mg_sk_... key, have key_id IS NULL and are
     excluded here (there's no key to attribute them to)."""
-    from magnet.postgres_store import get_pool_if_configured
-
-    pool = get_pool_if_configured()
+    pool = _pool_if_configured()
     if pool is None:
         return {}
     try:
