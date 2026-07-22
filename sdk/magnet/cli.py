@@ -13,6 +13,7 @@ import os
 import platform
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -145,18 +146,50 @@ def _write_claude_md(user_id: str, project_id: str = "", profile_id: str = "") -
 
 # ── JSON helpers ───────────────────────────────────────────────────────────────
 
+class ConfigReadError(RuntimeError):
+    """Raised when an existing client config cannot be safely updated."""
+
+
 def _read_json(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ConfigReadError(
+            f"Cannot safely update existing config {path}: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ConfigReadError(
+            f"Cannot safely update existing config {path}: expected a JSON object"
+        )
+    return data
 
 
 def _write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(data, temp_file, indent=2, ensure_ascii=False)
+            temp_file.write("\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        if path.exists():
+            temp_path.chmod(path.stat().st_mode & 0o777)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 # ── Binary detection ───────────────────────────────────────────────────────────
