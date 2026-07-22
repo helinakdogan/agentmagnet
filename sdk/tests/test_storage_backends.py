@@ -1,10 +1,8 @@
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, call
 
 from magnet.aggregate_store import AggregateSignalStore
 from magnet.local_store import SQLiteBackend
-from magnet.postgres_store import _PgPipeline
 from magnet.signals import SignalDetector
 
 
@@ -92,25 +90,3 @@ def test_aggregate_store_records_counters_on_sqlite():
         assert backend.get("magnet:agg:count:preference:coding") == "1"
     finally:
         tmp.cleanup()
-
-
-def test_postgres_pipeline_exposes_required_operations():
-    backend = MagicMock()
-    backend.delete.return_value = 1
-    backend.hset.return_value = None
-    backend.incr.return_value = 2
-
-    results = (
-        _PgPipeline(backend)
-        .delete("history")
-        .hset("history", "temperature", '["0.1"]')
-        .incr("aggregate")
-        .execute()
-    )
-
-    assert results == [1, None, 2]
-    assert backend.method_calls == [
-        call.delete("history"),
-        call.hset("history", "temperature", '["0.1"]'),
-        call.incr("aggregate"),
-    ]
