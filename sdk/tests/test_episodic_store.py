@@ -92,7 +92,7 @@ class TestEpisodicStoreRedisBackend(unittest.TestCase):
         redis_mock.zrevrange.return_value = []
         store.recall("proj:user1", "query", top_k=2)
         redis_mock.zrevrange.assert_called_once_with(
-            f"{_EPISODIC_KEY_PREFIX}proj:user1", 0, 1
+            f"{_EPISODIC_KEY_PREFIX}proj:user1", 0, _MAX_EPISODES - 1
         )
 
     def test_recall_returns_empty_when_no_redis(self):
@@ -108,7 +108,7 @@ class TestEpisodicStoreMemoryBackend(unittest.TestCase):
         store = EpisodicStore()  # Neither Redis nor Qdrant
         msgs = _make_messages(5)
         store.store_episode("proj:u1", msgs, importance=0.9)
-        results = store.recall("proj:u1", "test", top_k=3)
+        results = store.recall("proj:u1", "User message", top_k=3)
         self.assertEqual(len(results), 1)
         self.assertAlmostEqual(results[0]["importance"], 0.9)
 
@@ -116,7 +116,7 @@ class TestEpisodicStoreMemoryBackend(unittest.TestCase):
         store = EpisodicStore()
         store.store_episode("p:u", _make_messages(), importance=0.7, summary="low")
         store.store_episode("p:u", _make_messages(), importance=0.95, summary="high")
-        results = store.recall("p:u", "q", top_k=1)
+        results = store.recall("p:u", "high", top_k=1)
         self.assertEqual(results[0]["summary"], "high")
 
     def test_low_importance_not_stored_memory(self):
@@ -171,7 +171,7 @@ class TestEpisodicStoreCustomSummary(unittest.TestCase):
         store.store_episode(
             "p:u", msgs, summary="Custom summary", importance=0.8
         )
-        results = store.recall("p:u", "q", top_k=1)
+        results = store.recall("p:u", "Custom summary", top_k=1)
         self.assertEqual(results[0]["summary"], "Custom summary")
 
 

@@ -2,11 +2,9 @@
 Tests for MemoryOrchestrator.
 
 Scenarios:
-  - decide(): Correctly detects episodic trigger patterns (TR + EN)
-  - decide(): Returns episodic=False if there is no trigger
+  - decide(): Episodic retrieval is always active
   - decide(): Behavioral is always True, knowledge is always False
-  - build_context(): Returns only behavioral context when there is no trigger
-  - build_context(): Appends episodic context when a trigger is matched
+  - build_context(): Appends relevant episodic context returned by the store
   - build_context(): Returns an empty string if no profile exists
   - should_store_episode(): Long conversations increase importance
   - should_store_episode(): Correction signals increase importance
@@ -59,10 +57,10 @@ class TestDecide(unittest.TestCase):
         result = orc.decide("herhangi bir şey", "t:u")
         self.assertFalse(result["knowledge"])
 
-    def test_no_trigger_episodic_false(self):
+    def test_no_trigger_still_checks_episodic_relevance(self):
         orc = _make_orchestrator()
         result = orc.decide("Bugün hava nasıl?", "t:u")
-        self.assertFalse(result["episodic"])
+        self.assertTrue(result["episodic"])
 
     # ── Turkish triggers ─────────────────────────────────────────────
     def test_trigger_gecen_tr(self):
@@ -137,7 +135,7 @@ class TestBuildContext(unittest.TestCase):
         ctx = orc.build_context("normal soru", "t:u")
         self.assertIn("Behavioral Profile", ctx)
 
-    def test_episodic_context_not_included_without_trigger(self):
+    def test_episodic_context_included_when_store_returns_relevant_episode(self):
         profile = {
             "global_preferences": {"tone": {"value": "formal", "confidence": 0.8}},
             "contextual_profiles": {},
@@ -148,8 +146,8 @@ class TestBuildContext(unittest.TestCase):
         episodes = [{"summary": "Past episode summary", "importance": 0.9}]
         orc = _make_orchestrator(profile=profile, episodes=episodes)
         ctx = orc.build_context("Bugün ne yapmalıyım?", "t:u")
-        self.assertNotIn("Past Conversations", ctx)
-        self.assertNotIn("Past episode summary", ctx)
+        self.assertIn("Past Conversations", ctx)
+        self.assertIn("Past episode summary", ctx)
 
     def test_episodic_context_included_with_trigger(self):
         profile = {
